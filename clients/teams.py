@@ -45,8 +45,31 @@ class TeamsClient:
         with_retry(_call)
 
     def check_reachability(self) -> None:
-        """POST an empty payload — Teams acknowledges connectivity."""
-        self._post({})
+        """POST a minimal Adaptive Card to verify Teams webhook connectivity."""
+        self._post({
+            "type": "message",
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "type": "AdaptiveCard",
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "version": "1.5",
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": "🔗 Snyk Automation — Connectivity Test",
+                            "weight": "Bolder",
+                            "size": "Medium",
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": "Teams webhook is reachable.",
+                            "wrap": True,
+                        },
+                    ],
+                },
+            }],
+        })
 
     # ── Card dispatch ─────────────────────────────────────────────────────────
 

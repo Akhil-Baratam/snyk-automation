@@ -1,17 +1,16 @@
 """
-Snyk REST API client.
+Snyk API client.
 
-Responsibilities:
-  - Org reachability check (Phase 0)
-  - Paginated fetch of all org projects (groups by target in memory)
-  - Paginated fetch of all org targets (display names + remote URLs)
-  - Aggregation of critical/high counts per target, with per-file detail
-  - Filtering to only targets with C/H > 0
+Strategy:
+  1. REST API — fetch all projects (target→project mapping, paginated, ~6 calls)
+  2. REST API — fetch all targets  (display names + remote URLs, paginated, ~2 calls)
+  3. V1  API  — GET /v1/org/{org}/project/{id} per project (~530 calls)
+               → reads issueCountsBySeverity.critical / .high directly
 
-The client never fetches per-target individually to stay well within
-Snyk's rate limit (~1,620 req/min).
+Rate limit: ~1,620 req/min. 530 calls takes ~20s with 0.03s delay. Well within limits.
 """
 import logging
+import time
 from typing import Any
 
 import requests
@@ -24,12 +23,14 @@ from utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
-_API_VERSION = "2024-10-15"
+_REST_VERSION = "2024-10-15"
+_V1_BASE      = "https://api.snyk.io/v1"
 
 
 class SnykClient:
+
     def __init__(self) -> None:
-        self._base = config.SNYK_API_BASE_URL.rstrip("/")
+        self._base   = config.SNYK_API_BASE_URL.rstrip("/")
         self._org_id = config.SNYK_ORG_ID
         self._session = self._build_session()
 
@@ -42,10 +43,9 @@ class SnykClient:
             "Authorization": f"token {config.SNYK_API_TOKEN}",
             "Content-Type": "application/json",
         })
-        # urllib3-level retries disabled; all retries handled by with_retry
         adapter = HTTPAdapter(max_retries=Retry(total=0))
         session.mount("https://", adapter)
-        session.mount("http://", adapter)
+        session.mount("http://",  adapter)
         return session
 
     # ── Low-level HTTP ────────────────────────────────────────────────────────
@@ -57,157 +57,171 @@ class SnykClient:
             return resp.json()
         return with_retry(_call)
 
-    # ── Phase 0 check ─────────────────────────────────────────────────────────
+    # ── Phase 0 ───────────────────────────────────────────────────────────────
 
     def check_org_reachability(self) -> None:
-        """
-        GET /rest/orgs/{org_id} — validates token and org ID.
-        Raises on 401 (bad token), 404 (wrong org), or network error.
-        """
+        """Validates token + org ID. Raises on 401/404/timeout."""
         url = f"{self._base}/rest/orgs/{self._org_id}"
-        self._get(url, params={"version": _API_VERSION})
+        self._get(url, params={"version": _REST_VERSION})
 
-    # ── Pagination ────────────────────────────────────────────────────────────
+    # ── REST pagination ───────────────────────────────────────────────────────
 
-    def _paginate(self, url: str, params: dict[str, Any], resource_label: str) -> list[dict]:
-        """
-        Follow links.next cursors until exhausted.
-
-        Snyk may return next as a full URL or a relative path; both are
-        handled.  Query params embedded in next URLs take precedence.
-        """
+    def _paginate(self, url: str, params: dict[str, Any], label: str) -> list[dict]:
+        """Follow links.next cursors until exhausted."""
         items: list[dict] = []
         page = 1
         current_url: str = url
         current_params: dict[str, Any] | None = dict(params)
 
         while True:
-            logger.debug("Fetching %s page %d from %s", resource_label, page, current_url)
-            data = self._get(current_url, current_params)
-
-            batch: list[dict] = data.get("data", [])
+            data  = self._get(current_url, current_params)
+            batch = data.get("data", [])
             items.extend(batch)
-            logger.debug(
-                "%s page %d: %d items (running total: %d)",
-                resource_label, page, len(batch), len(items),
-            )
 
             next_link: str | None = data.get("links", {}).get("next")
             if not next_link:
                 break
 
-            if next_link.startswith("http"):
-                current_url = next_link
-                current_params = None  # params embedded in the absolute URL
-            else:
-                current_url = f"{self._base}{next_link}"
-                current_params = None
-
+            current_url    = next_link if next_link.startswith("http") else f"{self._base}{next_link}"
+            current_params = None
             page += 1
 
-        logger.info("Fetched %d %s across %d page(s)", len(items), resource_label, page)
+        logger.info("Fetched %d %s across %d page(s)", len(items), label, page)
         return items
 
-    # ── Public fetch methods ──────────────────────────────────────────────────
+    # ── REST fetch methods ────────────────────────────────────────────────────
 
     def fetch_all_projects(self) -> list[dict]:
-        url = f"{self._base}/rest/orgs/{self._org_id}/projects"
-        params: dict[str, Any] = {
-            "version": _API_VERSION,
-            "limit": config.SNYK_PAGE_SIZE,
-            "exclude_empty": "true",
-        }
+        """
+        GET /rest/orgs/{org}/projects
+        Returns project list with target relationships (no issue counts).
+        """
+        url    = f"{self._base}/rest/orgs/{self._org_id}/projects"
+        params = {"version": _REST_VERSION, "limit": config.SNYK_PAGE_SIZE}
         return self._paginate(url, params, "projects")
 
     def fetch_all_targets(self) -> list[dict]:
-        url = f"{self._base}/rest/orgs/{self._org_id}/targets"
-        params: dict[str, Any] = {
-            "version": _API_VERSION,
-            "limit": config.SNYK_PAGE_SIZE,
-        }
+        """
+        GET /rest/orgs/{org}/targets
+        Returns target display names and remote URLs.
+        """
+        url    = f"{self._base}/rest/orgs/{self._org_id}/targets"
+        params = {"version": _REST_VERSION, "limit": config.SNYK_PAGE_SIZE}
         return self._paginate(url, params, "targets")
+
+    def fetch_projects_for_target(self, target_id: str) -> list[dict]:
+        """
+        GET /rest/orgs/{org}/projects?target_id={target_id}
+        Returns only projects belonging to a specific target.
+        Used by the demo to avoid fetching all 530 projects.
+        """
+        url    = f"{self._base}/rest/orgs/{self._org_id}/projects"
+        params = {
+            "version":   _REST_VERSION,
+            "limit":     config.SNYK_PAGE_SIZE,
+            "target_id": target_id,
+        }
+        return self._paginate(url, params, f"projects[{target_id[:8]}]")
+
+    # ── V1 issue counts ───────────────────────────────────────────────────────
+
+    def fetch_project_issue_counts(self, project_id: str) -> dict[str, int]:
+        """
+        GET /v1/org/{org}/project/{project_id}
+
+        Returns issueCountsBySeverity directly:
+        {
+            "critical": int,
+            "high":     int,
+            "medium":   int,
+            "low":      int,
+        }
+        """
+        url  = f"{_V1_BASE}/org/{self._org_id}/project/{project_id}"
+        data = self._get(url)
+        counts = data.get("issueCountsBySeverity", {})
+        return {
+            "critical": int(counts.get("critical") or 0),
+            "high":     int(counts.get("high")     or 0),
+            "medium":   int(counts.get("medium")   or 0),
+            "low":      int(counts.get("low")      or 0),
+        }
 
     # ── In-memory aggregation ─────────────────────────────────────────────────
 
     def build_target_map(self, projects: list[dict]) -> dict[str, dict]:
         """
-        Group active projects by target ID, summing critical + high counts.
-        Stores per-file ProjectDetail only for files that have C or H > 0
-        (description table only shows actionable files).
+        For every active project:
+          1. GET V1 project → read issueCountsBySeverity
+          2. Accumulate counts by target_id
+          3. Store ProjectDetail only for files with C/H > 0
 
         Returns:
             {
                 target_id: {
                     "critical": int,
-                    "high": int,
-                    "projects": [ProjectDetail, ...]   # only C/H > 0 files
+                    "high":     int,
+                    "projects": [ProjectDetail, ...]
                 }
             }
-
-        all_target_ids is NOT built here — it comes from the authoritative
-        targets API response in get_aggregated_targets() (Fix 2).
         """
+        active = [p for p in projects if p.get("attributes", {}).get("status") == "active"]
+        total  = len(active)
         target_map: dict[str, dict] = {}
 
-        for project in projects:
-            attrs: dict = project.get("attributes", {})
+        logger.info("Fetching issue counts for %d active projects via V1 API...", total)
 
-            if attrs.get("status") != "active":
-                continue
-
-            tid: str | None = (
+        for idx, project in enumerate(active, start=1):
+            proj_id   = project.get("id", "")
+            proj_name = project.get("attributes", {}).get("name", "")
+            target_id = (
                 project
                 .get("relationships", {})
                 .get("target", {})
                 .get("data", {})
                 .get("id")
             )
-            if not tid:
-                logger.debug(
-                    "Project %s has no target relationship — skipping", project.get("id")
-                )
+
+            if not proj_id or not target_id:
                 continue
 
-            # Snyk may use either field name depending on API version
-            issue_counts: dict = (
-                attrs.get("issueCounts")
-                or attrs.get("issueCountsBySeverity")
-                or {}
-            )
-            critical = int(issue_counts.get("critical") or 0)
-            high     = int(issue_counts.get("high")     or 0)
-            medium   = int(issue_counts.get("medium")   or 0)
-            low      = int(issue_counts.get("low")      or 0)
-            project_name: str = attrs.get("name", "")
-            project_id: str   = project.get("id", "")
+            if idx % 50 == 0 or idx == total:
+                logger.info("  Progress: %d/%d projects processed", idx, total)
 
-            if tid not in target_map:
-                target_map[tid] = {"critical": 0, "high": 0, "projects": []}
+            try:
+                counts = self.fetch_project_issue_counts(proj_id)
+            except Exception as exc:
+                logger.warning(
+                    "  Could not fetch counts for project %s (%s): %s",
+                    proj_id, proj_name, exc
+                )
+                counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
 
-            target_map[tid]["critical"] += critical
-            target_map[tid]["high"]     += high
+            if target_id not in target_map:
+                target_map[target_id] = {"critical": 0, "high": 0, "projects": []}
 
-            # Only include in description table if file has C or H vulns
-            if (critical > 0 or high > 0) and project_name:
-                target_map[tid]["projects"].append(
+            target_map[target_id]["critical"] += counts["critical"]
+            target_map[target_id]["high"]     += counts["high"]
+
+            # Only include in description table if this file has C or H vulns
+            if (counts["critical"] > 0 or counts["high"] > 0) and proj_name:
+                target_map[target_id]["projects"].append(
                     ProjectDetail(
-                        name=project_name,
-                        project_id=project_id,
-                        critical=critical,
-                        high=high,
-                        medium=medium,
-                        low=low,
+                        name       = proj_name,
+                        project_id = proj_id,
+                        critical   = counts["critical"],
+                        high       = counts["high"],
+                        medium     = counts["medium"],
+                        low        = counts["low"],
                     )
                 )
+
+            time.sleep(0.03)  # ~33 req/s — well within 1,620/min limit
 
         return target_map
 
     def build_target_lookup(self, targets: list[dict]) -> dict[str, dict]:
-        """
-        Returns { target_id: {"display_name": str, "remote_url": str} }
-        from the raw targets list.
-        remote_url is the GitLab repo URL stored on the Snyk target.
-        """
+        """Returns { target_id: {"display_name": str, "remote_url": str} }"""
         result: dict[str, dict] = {}
         for t in targets:
             tid = t.get("id")
@@ -215,8 +229,8 @@ class SnykClient:
                 continue
             attrs = t.get("attributes", {})
             result[tid] = {
-                "display_name": attrs.get("displayName", ""),
-                "remote_url": attrs.get("url", "") or attrs.get("remoteUrl", ""),
+                "display_name": attrs.get("display_name", ""),
+                "remote_url":   attrs.get("url", "") or attrs.get("remoteUrl", ""),
             }
         return result
 
@@ -224,44 +238,34 @@ class SnykClient:
 
     def get_aggregated_targets(self) -> tuple[list[SnykTarget], set[str]]:
         """
-        Full Phase 1 data-collection pipeline:
+        Full Phase 1 pipeline:
 
-          1. Fetch all projects (paginated).
-          2. Group by target, sum critical + high, store ProjectDetail per file.
-          3. Fetch all targets for display names and remote URLs.
-          4. Build all_target_ids from the targets API response — authoritative
-             full set regardless of project active/inactive status (Fix 2).
-          5. Filter to only targets with C > 0 or H > 0.
+          Step 1 — GET /rest/orgs/{org}/projects   → project list (target mapping)
+          Step 2 — GET /rest/orgs/{org}/targets    → display names, all_target_ids
+          Step 3 — GET /v1/org/{org}/project/{id}  × N → issueCountsBySeverity
+          Step 4 — Group by target, filter to C/H > 0
 
         Returns:
             (targets_with_vulns, all_target_ids)
 
-            all_target_ids contains every target UUID from the targets API —
-            so Phase 2's reverse check can correctly distinguish "clean repo"
-            from "repo deleted from Snyk entirely".
+            all_target_ids = every target UUID in the org — used by Phase 2
+            reverse check to distinguish "clean repo" vs "repo deleted from Snyk".
         """
-        logger.info("Fetching all projects for org %s", self._org_id)
+        logger.info("Step 1/3 — Fetching all projects")
         projects = self.fetch_all_projects()
         logger.info("Fetched %d projects total", len(projects))
 
+        logger.info("Step 2/3 — Fetching all targets")
+        raw_targets    = self.fetch_all_targets()
+        all_target_ids = {t["id"] for t in raw_targets if t.get("id")}
+        target_lookup  = self.build_target_lookup(raw_targets)
+        logger.info("Fetched %d targets total", len(all_target_ids))
+
+        logger.info("Step 3/3 — Fetching issue counts per project")
         target_map = self.build_target_map(projects)
 
-        vuln_count = sum(
-            1 for v in target_map.values() if v["critical"] > 0 or v["high"] > 0
-        )
-
-        logger.info("Fetching all targets for display names and remote URLs")
-        raw_targets = self.fetch_all_targets()
-
-        # Build all_target_ids from the authoritative targets API response
-        all_target_ids: set[str] = {t["id"] for t in raw_targets if t.get("id")}
-        logger.info(
-            "Targets API returned %d targets; %d active targets have C/H vulns",
-            len(all_target_ids),
-            vuln_count,
-        )
-
-        target_lookup = self.build_target_lookup(raw_targets)
+        vuln_count = sum(1 for v in target_map.values() if v["critical"] > 0 or v["high"] > 0)
+        logger.info("%d targets have C/H vulnerabilities", vuln_count)
 
         results: list[SnykTarget] = []
         for tid, data in target_map.items():
@@ -270,12 +274,12 @@ class SnykClient:
             lookup = target_lookup.get(tid, {})
             results.append(
                 SnykTarget(
-                    id=tid,
-                    display_name=lookup.get("display_name") or f"target-{tid[:8]}",
-                    critical=data["critical"],
-                    high=data["high"],
-                    remote_url=lookup.get("remote_url", ""),
-                    projects=data["projects"],
+                    id           = tid,
+                    display_name = lookup.get("display_name") or f"target-{tid[:8]}",
+                    critical     = data["critical"],
+                    high         = data["high"],
+                    remote_url   = lookup.get("remote_url", ""),
+                    projects     = data["projects"],
                 )
             )
 
