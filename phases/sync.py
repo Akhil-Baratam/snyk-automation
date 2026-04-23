@@ -25,28 +25,45 @@ logger = logging.getLogger(__name__)
 # ── URL helpers ───────────────────────────────────────────────────────────────
 
 def _snyk_target_url(target_id: str) -> str:
-    """Best-effort Snyk UI URL for a target (project page)."""
+    """Snyk UI URL for a target (project page), using org slug when available."""
+    slug = config.SNYK_ORG_SLUG
+    if slug:
+        return f"https://app.snyk.io/org/{slug}/project/{target_id}"
     ui_base = config.SNYK_API_BASE_URL.replace("api.snyk.io", "app.snyk.io").rstrip("/")
     return f"{ui_base}/org/{config.SNYK_ORG_ID}/project/{target_id}"
+
+
+def _snyk_project_url(project_id: str) -> str:
+    """Snyk UI URL for a specific project (file-level scan), using org slug when available."""
+    slug = config.SNYK_ORG_SLUG
+    if slug:
+        return f"https://app.snyk.io/org/{slug}/project/{project_id}"
+    return f"https://app.snyk.io/org/{config.SNYK_ORG_ID}/project/{project_id}"
+
+
+def _gitlab_file_url(remote_url: str, file_path: str) -> str:
+    """GitLab blob URL for a specific file on the configured default branch."""
+    base = remote_url.rstrip("/")
+    branch = config.GITLAB_DEFAULT_BRANCH
+    return f"{base}/blob/{branch}/{file_path}"
 
 
 # ── Jira ticket content builders ──────────────────────────────────────────────
 
 def _build_summary(display_name: str, critical: int, high: int, today: str) -> str:
     """
-    Produces:  Snyk Vulnerabilities Check Repo Name: <name>, Severity[C4H12 as on 22/04/26]
-
-    today is ISO format YYYY-MM-DD; the spec wants DD/MM/YY.
+    Production format:
+        Snyk Vulnerabilities Check Repo Name:{name} [ C{c} H{h} as on {MM/DD/YY}]
     """
     parts = today.split("-")          # ["2026", "04", "23"]
-    dd_mm_yy = f"{parts[2]}/{parts[1]}/{parts[0][2:]}"   # "23/04/26"
+    mm_dd_yy = f"{parts[1]}/{parts[2]}/{parts[0][2:]}"   # "04/23/26"
     return (
-        f"Snyk Vulnerabilities Check Repo Name: {display_name},"
-        f" Severity[C{critical}H{high} as on {dd_mm_yy}]"
+        f"Snyk Vulnerabilities Check Repo Name:{display_name}"
+        f" [ C{critical} H{high} as on {mm_dd_yy}]"
     )
 
 
-# ── ADF helpers ───────────────────────────────────────────────────────────────
+# ── ADF node factories ────────────────────────────────────────────────────────
 
 def _text(t: str, bold: bool = False) -> dict:
     node: dict = {"type": "text", "text": t}
@@ -84,69 +101,90 @@ def _table(rows: list[dict]) -> dict:
     }
 
 
-def _heading(text: str, level: int = 3) -> dict:
-    return {
-        "type": "heading",
-        "attrs": {"level": level},
-        "content": [_text(text, bold=True)],
-    }
-
+# ── ADF description ───────────────────────────────────────────────────────────
 
 def _build_adf_description(target: SnykTarget) -> dict:
     """
-    ADF document matching §13 of the spec.
+    ADF document matching §13 + production ticket format.
 
-    Table 1 — Vulnerability breakdown by scanned file
-      File | Critical | High
+    Table 1 — Snyk vulnerability per file (C/H > 0 files only)
+      Snyk vulnerability | Gitlab link | Severity Breakdown
 
-    Table 2 — GitLab project details
-      GitLab Project | Snyk Target | Files Scanned
+    Table 2 — Repository key-value details
+      Field | Description / Example
     """
-    snyk_url = _snyk_target_url(target.id)
+    content: list[dict] = []
 
-    # Table 1: per-file breakdown
+    # ── Table 1: per-file snyk + gitlab links ─────────────────────────────────
     header_row_1 = _row([
-        _cell([_text("File", bold=True)], is_header=True),
-        _cell([_text("Critical", bold=True)], is_header=True),
-        _cell([_text("High", bold=True)], is_header=True),
+        _cell([_text("Snyk vulnerability", bold=True)], is_header=True),
+        _cell([_text("Gitlab link",        bold=True)], is_header=True),
+        _cell([_text("Severity Breakdown", bold=True)], is_header=True),
     ])
-    file_rows = [
-        _row([
-            _cell([_text(p.name)]),
-            _cell([_text(str(p.critical))]),
-            _cell([_text(str(p.high))]),
-        ])
-        for p in target.projects
-    ]
+
+    file_rows: list[dict] = []
+    for p in target.projects:
+        snyk_url   = _snyk_project_url(p.project_id)
+        gitlab_url = _gitlab_file_url(target.remote_url, p.name) if target.remote_url else ""
+        severity   = f"C{p.critical} H{p.high} M{p.medium} L{p.low}"
+
+        file_rows.append(_row([
+            _cell([_link_node(snyk_url, snyk_url)] if snyk_url else [_text("—")]),
+            _cell([_link_node(gitlab_url, gitlab_url)] if gitlab_url else [_text("—")]),
+            _cell([_text(severity)]),
+        ]))
+
     if not file_rows:
         file_rows = [_row([
-            _cell([_text("(no file-level data)")]),
+            _cell([_text("No C/H vulnerability data available")]),
             _cell([_text("—")]),
             _cell([_text("—")]),
         ])]
 
-    # Table 2: target summary
-    header_row_2 = _row([
-        _cell([_text("GitLab Project", bold=True)], is_header=True),
-        _cell([_text("Snyk Target", bold=True)], is_header=True),
-        _cell([_text("Files Scanned", bold=True)], is_header=True),
-    ])
-    summary_row = _row([
-        _cell([_text(target.display_name)]),
-        _cell([_link_node("Open in Snyk", snyk_url)]),
-        _cell([_text(str(len(target.projects)))]),
-    ])
+    content.append({
+        "type": "paragraph",
+        "content": [_text("Snyk Vulnerability:", bold=True)],
+    })
+    content.append(_table([header_row_1, *file_rows]))
 
-    return {
-        "type": "doc",
-        "version": 1,
-        "content": [
-            _heading("Vulnerability Breakdown by File"),
-            _table([header_row_1, *file_rows]),
-            _heading("GitLab Project Details"),
-            _table([header_row_2, summary_row]),
-        ],
-    }
+    # ── Table 2: repository key-value details ─────────────────────────────────
+    repo_url_nodes = (
+        [_link_node(target.remote_url, target.remote_url)]
+        if target.remote_url else [_text("—")]
+    )
+    total_projects = len(target.projects)
+
+    kv_rows: list[tuple[str, list[dict]]] = [
+        ("Repository Name",   [_text(target.display_name)]),
+        ("Repo URL",          repo_url_nodes),
+        ("Last Commit Date",  [_text("-")]),
+        ("Active in Production", [_text("")]),
+        ("Critical for Enterprise", [_text("-")]),
+        ("Facing Type",       [_text("")]),
+        ("Service Name",      [_text("")]),
+        ("Owner / Maintainer", [_text("")]),
+        ("Snyk Vulnerabilities (Count) (For all severities)", [_text(str(total_projects))]),
+        ("Severity Breakdown", [_text(f"Critical:{target.critical}, High:{target.high}")]),
+        ("Mitigation Status", [_text("-")]),
+        ("Notes / Comments",  [_text("")]),
+    ]
+
+    kv_table_rows = [
+        _row([
+            _cell([_text("Field",                bold=True)], is_header=True),
+            _cell([_text("Description / Example", bold=True)], is_header=True),
+        ])
+    ] + [
+        _row([
+            _cell([_text(field, bold=True)]),
+            _cell(value_nodes),
+        ])
+        for field, value_nodes in kv_rows
+    ]
+
+    content.append(_table(kv_table_rows))
+
+    return {"type": "doc", "version": 1, "content": content}
 
 
 # ── Phase 2 entry point ───────────────────────────────────────────────────────
@@ -201,11 +239,11 @@ def run_sync(
             )
             continue
 
-        ticket_url = jira.ticket_url(ticket.key)
-        target_name = ticket.summary  # best available without extra API call
+        ticket_url  = jira.ticket_url(ticket.key)
+        target_name = ticket.summary
 
         if snyk_id not in all_target_ids:
-            # Target UUID not seen in Snyk at all — deleted or renamed
+            # Target UUID absent from the targets API — deleted or renamed
             result.flagged.append(FlaggedTicket(
                 target_name=target_name,
                 ticket_key=ticket.key,
@@ -215,7 +253,7 @@ def run_sync(
             logger.info("[%s] %s — flagged: project_deleted", target_name, ticket.key)
 
         elif snyk_id not in target_ids_with_vulns:
-            # Target exists in Snyk but has zero C/H vulns — was filtered out in Phase 1
+            # Target exists in Snyk but has zero C/H vulns (filtered out in Phase 1)
             result.flagged.append(FlaggedTicket(
                 target_name=target_name,
                 ticket_key=ticket.key,
@@ -223,7 +261,7 @@ def run_sync(
                 reason="vulns_resolved",
             ))
             logger.info("[%s] %s — flagged: vulns_resolved", target_name, ticket.key)
-        # else: ticket correctly open, handled by forward check — no action
+        # else: ticket correctly open — forward check already handled it
 
     logger.info("Phase 2 reverse check — complete. flagged=%d", len(result.flagged))
     return result
@@ -255,7 +293,7 @@ def _forward_check_target(
             logger.info("[%s] Fallback found %s — backfilling snyk_project_id", target.display_name, ticket.key)
             jira.backfill_snyk_project_id(ticket.key, target.id)
 
-    # Step C — branch
+    # Step C — branch on ticket existence and count delta
     if ticket is None:
         _create_ticket(target, jira, current_state, result, today)
     else:
@@ -278,24 +316,24 @@ def _create_ticket(
     result: RunResult,
     today: str,
 ) -> None:
-    summary = _build_summary(target.display_name, target.critical, target.high, today)
+    summary     = _build_summary(target.display_name, target.critical, target.high, today)
     description = _build_adf_description(target)
     custom_fields = {
-        config.JIRA_FIELD_SNYK_PROJECT_ID: target.id,
+        config.JIRA_FIELD_SNYK_PROJECT_ID:     target.id,
         config.JIRA_FIELD_SNYK_CRITICAL_COUNT: target.critical,
-        config.JIRA_FIELD_SNYK_HIGH_COUNT: target.high,
-        config.JIRA_FIELD_SNYK_LAST_SYNCED: today,
+        config.JIRA_FIELD_SNYK_HIGH_COUNT:     target.high,
+        config.JIRA_FIELD_SNYK_LAST_SYNCED:    today,
     }
     key = jira.create_ticket(summary, description, custom_fields)
     logger.info("[%s] NO ticket found → created %s", target.display_name, key)
 
     entry = state.upsert_target(current_state, target.id, target.display_name)
-    entry["jira_ticket"] = key
+    entry["jira_ticket"]   = key
     entry["created_today"] = True
-    entry["critical"] = target.critical
-    entry["high"] = target.high
-    entry["last_changed"] = today
-    entry["last_synced"] = today
+    entry["critical"]      = target.critical
+    entry["high"]          = target.high
+    entry["last_changed"]  = today
+    entry["last_synced"]   = today
 
     result.created.append(CreatedTicket(
         target_name=target.display_name,
@@ -320,8 +358,8 @@ def _update_ticket(
     # Update only the 3 machine-managed fields; never touch summary or description
     jira.update_fields(ticket_key, {
         config.JIRA_FIELD_SNYK_CRITICAL_COUNT: target.critical,
-        config.JIRA_FIELD_SNYK_HIGH_COUNT: target.high,
-        config.JIRA_FIELD_SNYK_LAST_SYNCED: today,
+        config.JIRA_FIELD_SNYK_HIGH_COUNT:     target.high,
+        config.JIRA_FIELD_SNYK_LAST_SYNCED:    today,
     })
     logger.info(
         "[%s] Ticket %s — CHANGED C%dH%d→C%dH%d → updating fields",
@@ -329,10 +367,10 @@ def _update_ticket(
     )
 
     entry = current_state["targets"].setdefault(target.id, {})
-    entry["critical"] = target.critical
-    entry["high"] = target.high
+    entry["critical"]     = target.critical
+    entry["high"]         = target.high
     entry["last_changed"] = today
-    entry["last_synced"] = today
+    entry["last_synced"]  = today
 
     result.updated.append(UpdatedTicket(
         target_name=target.display_name,

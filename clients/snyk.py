@@ -4,7 +4,7 @@ Snyk REST API client.
 Responsibilities:
   - Org reachability check (Phase 0)
   - Paginated fetch of all org projects (groups by target in memory)
-  - Paginated fetch of all org targets (display names)
+  - Paginated fetch of all org targets (display names + remote URLs)
   - Aggregation of critical/high counts per target, with per-file detail
   - Filtering to only targets with C/H > 0
 
@@ -128,27 +128,23 @@ class SnykClient:
 
     # ── In-memory aggregation ─────────────────────────────────────────────────
 
-    def build_target_map(
-        self,
-        projects: list[dict],
-        all_target_ids: set[str] | None = None,
-    ) -> dict[str, dict]:
+    def build_target_map(self, projects: list[dict]) -> dict[str, dict]:
         """
-        Group active projects by target ID, summing critical + high counts
-        and storing per-file ProjectDetail objects.
+        Group active projects by target ID, summing critical + high counts.
+        Stores per-file ProjectDetail only for files that have C or H > 0
+        (description table only shows actionable files).
 
         Returns:
             {
                 target_id: {
                     "critical": int,
                     "high": int,
-                    "projects": [ProjectDetail, ...]
+                    "projects": [ProjectDetail, ...]   # only C/H > 0 files
                 }
             }
 
-        If all_target_ids is provided it is populated in-place with every
-        target UUID seen, including those with zero vulns.  Phase 2's reverse
-        check needs this to distinguish "clean repo" from "deleted target".
+        all_target_ids is NOT built here — it comes from the authoritative
+        targets API response in get_aggregated_targets() (Fix 2).
         """
         target_map: dict[str, dict] = {}
 
@@ -171,9 +167,6 @@ class SnykClient:
                 )
                 continue
 
-            if all_target_ids is not None:
-                all_target_ids.add(tid)
-
             # Snyk may use either field name depending on API version
             issue_counts: dict = (
                 attrs.get("issueCounts")
@@ -181,28 +174,50 @@ class SnykClient:
                 or {}
             )
             critical = int(issue_counts.get("critical") or 0)
-            high = int(issue_counts.get("high") or 0)
+            high     = int(issue_counts.get("high")     or 0)
+            medium   = int(issue_counts.get("medium")   or 0)
+            low      = int(issue_counts.get("low")      or 0)
             project_name: str = attrs.get("name", "")
+            project_id: str   = project.get("id", "")
 
             if tid not in target_map:
                 target_map[tid] = {"critical": 0, "high": 0, "projects": []}
 
             target_map[tid]["critical"] += critical
-            target_map[tid]["high"] += high
-            if project_name:
+            target_map[tid]["high"]     += high
+
+            # Only include in description table if file has C or H vulns
+            if (critical > 0 or high > 0) and project_name:
                 target_map[tid]["projects"].append(
-                    ProjectDetail(name=project_name, critical=critical, high=high)
+                    ProjectDetail(
+                        name=project_name,
+                        project_id=project_id,
+                        critical=critical,
+                        high=high,
+                        medium=medium,
+                        low=low,
+                    )
                 )
 
         return target_map
 
-    def build_display_name_lookup(self, targets: list[dict]) -> dict[str, str]:
-        """Returns { target_id: display_name } from the raw targets list."""
-        return {
-            t["id"]: t.get("attributes", {}).get("displayName", "")
-            for t in targets
-            if t.get("id")
-        }
+    def build_target_lookup(self, targets: list[dict]) -> dict[str, dict]:
+        """
+        Returns { target_id: {"display_name": str, "remote_url": str} }
+        from the raw targets list.
+        remote_url is the GitLab repo URL stored on the Snyk target.
+        """
+        result: dict[str, dict] = {}
+        for t in targets:
+            tid = t.get("id")
+            if not tid:
+                continue
+            attrs = t.get("attributes", {})
+            result[tid] = {
+                "display_name": attrs.get("displayName", ""),
+                "remote_url": attrs.get("url", "") or attrs.get("remoteUrl", ""),
+            }
+        return result
 
     # ── Top-level pipeline ────────────────────────────────────────────────────
 
@@ -212,46 +227,53 @@ class SnykClient:
 
           1. Fetch all projects (paginated).
           2. Group by target, sum critical + high, store ProjectDetail per file.
-          3. Fetch all targets for display names.
-          4. Filter to only targets with C > 0 or H > 0.
+          3. Fetch all targets for display names and remote URLs.
+          4. Build all_target_ids from the targets API response — authoritative
+             full set regardless of project active/inactive status (Fix 2).
+          5. Filter to only targets with C > 0 or H > 0.
 
         Returns:
             (targets_with_vulns, all_target_ids)
 
-            all_target_ids contains every target UUID seen — including those
-            with zero vulns — so Phase 2's reverse check can tell "clean repo"
-            apart from "repo deleted from Snyk".
+            all_target_ids contains every target UUID from the targets API —
+            so Phase 2's reverse check can correctly distinguish "clean repo"
+            from "repo deleted from Snyk entirely".
         """
         logger.info("Fetching all projects for org %s", self._org_id)
         projects = self.fetch_all_projects()
         logger.info("Fetched %d projects total", len(projects))
 
-        all_target_ids: set[str] = set()
-        target_map = self.build_target_map(projects, all_target_ids=all_target_ids)
+        target_map = self.build_target_map(projects)
 
         vuln_count = sum(
             1 for v in target_map.values() if v["critical"] > 0 or v["high"] > 0
         )
+
+        logger.info("Fetching all targets for display names and remote URLs")
+        raw_targets = self.fetch_all_targets()
+
+        # Build all_target_ids from the authoritative targets API response
+        all_target_ids: set[str] = {t["id"] for t in raw_targets if t.get("id")}
         logger.info(
-            "Grouped into %d unique targets; %d have Critical/High vulns",
+            "Targets API returned %d targets; %d active targets have C/H vulns",
             len(all_target_ids),
             vuln_count,
         )
 
-        logger.info("Fetching target display names")
-        raw_targets = self.fetch_all_targets()
-        display_names = self.build_display_name_lookup(raw_targets)
+        target_lookup = self.build_target_lookup(raw_targets)
 
         results: list[SnykTarget] = []
         for tid, data in target_map.items():
             if data["critical"] == 0 and data["high"] == 0:
                 continue
+            lookup = target_lookup.get(tid, {})
             results.append(
                 SnykTarget(
                     id=tid,
-                    display_name=display_names.get(tid) or f"target-{tid[:8]}",
+                    display_name=lookup.get("display_name") or f"target-{tid[:8]}",
                     critical=data["critical"],
                     high=data["high"],
+                    remote_url=lookup.get("remote_url", ""),
                     projects=data["projects"],
                 )
             )

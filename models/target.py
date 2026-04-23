@@ -3,9 +3,12 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ProjectDetail:
-    name: str
+    name: str           # file path within repo, e.g. "package.json"
+    project_id: str     # Snyk project UUID
     critical: int
     high: int
+    medium: int = 0
+    low: int = 0
 
 
 @dataclass
@@ -14,6 +17,7 @@ class SnykTarget:
     display_name: str
     critical: int
     high: int
+    remote_url: str = ""
     projects: list[ProjectDetail] = field(default_factory=list)
 
     @property

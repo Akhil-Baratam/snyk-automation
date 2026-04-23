@@ -37,12 +37,10 @@ def run_collect(current_state: dict) -> tuple[list[SnykTarget], set[str]]:
     current_state["total_count"] = len(targets)
 
     for t in targets:
-        entry = state.upsert_target(current_state, t.id, t.display_name)
-        # Update counts in state so delta detection in Phase 2 compares
-        # against the current run's snapshot, not stale previous values.
-        # Preserve jira_ticket, created_today, last_changed, last_synced.
-        entry["critical"] = t.critical
-        entry["high"] = t.high
+        state.upsert_target(current_state, t.id, t.display_name)
+        # Do NOT set critical/high here.
+        # Phase 2 owns those fields and uses the existing state values
+        # as the delta baseline for change detection.
 
     current_state["run_status"] = "partial"
     state.upload_state(current_state)

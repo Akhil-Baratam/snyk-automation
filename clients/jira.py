@@ -132,9 +132,10 @@ class JiraClient:
 
     def find_open_ticket_by_name(self, display_name: str) -> JiraTicket | None:
         """Fallback search: by label + summary text match."""
+        safe_name = display_name.replace('\\', '\\\\').replace('"', '\\"')
         jql = (
             f'labels = "{config.JIRA_TICKET_LABEL}"'
-            f' AND summary ~ "{display_name}"'
+            f' AND summary ~ "{safe_name}"'
             f" AND statusCategory != Done"
         )
         fields = [

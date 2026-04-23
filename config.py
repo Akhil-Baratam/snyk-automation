@@ -43,6 +43,7 @@ def _bool_env(name: str, default: bool = False) -> bool:
 SNYK_API_TOKEN: str = _require("SNYK_API_TOKEN")
 SNYK_ORG_ID: str = _require("SNYK_ORG_ID")
 SNYK_API_BASE_URL: str = _optional("SNYK_API_BASE_URL", "https://api.snyk.io")
+SNYK_ORG_SLUG: str = _optional("SNYK_ORG_SLUG", "")
 
 # ── Jira ─────────────────────────────────────────────────────────────────────
 JIRA_BASE_URL: str = _require("JIRA_BASE_URL")
@@ -66,6 +67,10 @@ AWS_REGION: str = _optional("AWS_REGION", "ap-south-1")
 # Optional — left blank when running under IAM role / instance profile
 AWS_ACCESS_KEY_ID: str = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
 AWS_SECRET_ACCESS_KEY: str = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
+
+# ── GitLab ────────────────────────────────────────────────────────────────────
+GITLAB_BASE_URL: str = _optional("GITLAB_BASE_URL", "https://gitlab.com")
+GITLAB_DEFAULT_BRANCH: str = _optional("GITLAB_DEFAULT_BRANCH", "master")
 
 # ── Script behaviour ──────────────────────────────────────────────────────────
 MAX_RETRY_ATTEMPTS: int = _int_env("MAX_RETRY_ATTEMPTS", 3)
