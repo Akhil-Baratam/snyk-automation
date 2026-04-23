@@ -115,6 +115,7 @@ class SnykClient:
         params: dict[str, Any] = {
             "version": _API_VERSION,
             "limit": config.SNYK_PAGE_SIZE,
+            "exclude_empty": "true",
         }
         return self._paginate(url, params, "projects")
 
