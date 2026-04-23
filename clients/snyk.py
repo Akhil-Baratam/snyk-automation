@@ -2,9 +2,10 @@
 Snyk REST API client.
 
 Responsibilities:
+  - Org reachability check (Phase 0)
   - Paginated fetch of all org projects (groups by target in memory)
   - Paginated fetch of all org targets (display names)
-  - Aggregation of critical/high counts per target
+  - Aggregation of critical/high counts per target, with per-file detail
   - Filtering to only targets with C/H > 0
 
 The client never fetches per-target individually to stay well within
@@ -18,7 +19,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import config
-from models.target import SnykTarget
+from models.target import ProjectDetail, SnykTarget
 from utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
@@ -54,8 +55,17 @@ class SnykClient:
             resp = self._session.get(url, params=params, timeout=30)
             resp.raise_for_status()
             return resp.json()
-
         return with_retry(_call)
+
+    # ── Phase 0 check ─────────────────────────────────────────────────────────
+
+    def check_org_reachability(self) -> None:
+        """
+        GET /rest/orgs/{org_id} — validates token and org ID.
+        Raises on 401 (bad token), 404 (wrong org), or network error.
+        """
+        url = f"{self._base}/rest/orgs/{self._org_id}"
+        self._get(url, params={"version": _API_VERSION})
 
     # ── Pagination ────────────────────────────────────────────────────────────
 
@@ -88,7 +98,7 @@ class SnykClient:
 
             if next_link.startswith("http"):
                 current_url = next_link
-                current_params = None  # params are embedded in the absolute URL
+                current_params = None  # params embedded in the absolute URL
             else:
                 current_url = f"{self._base}{next_link}"
                 current_params = None
@@ -124,14 +134,21 @@ class SnykClient:
         all_target_ids: set[str] | None = None,
     ) -> dict[str, dict]:
         """
-        Group active projects by target ID, summing critical + high counts.
+        Group active projects by target ID, summing critical + high counts
+        and storing per-file ProjectDetail objects.
 
         Returns:
-            { target_id: { "critical": int, "high": int, "projects": [str] } }
+            {
+                target_id: {
+                    "critical": int,
+                    "high": int,
+                    "projects": [ProjectDetail, ...]
+                }
+            }
 
         If all_target_ids is provided it is populated in-place with every
         target UUID seen, including those with zero vulns.  Phase 2's reverse
-        check needs this to distinguish "clean" from "deleted".
+        check needs this to distinguish "clean repo" from "deleted target".
         """
         target_map: dict[str, dict] = {}
 
@@ -173,7 +190,9 @@ class SnykClient:
             target_map[tid]["critical"] += critical
             target_map[tid]["high"] += high
             if project_name:
-                target_map[tid]["projects"].append(project_name)
+                target_map[tid]["projects"].append(
+                    ProjectDetail(name=project_name, critical=critical, high=high)
+                )
 
         return target_map
 
@@ -192,7 +211,7 @@ class SnykClient:
         Full Phase 1 data-collection pipeline:
 
           1. Fetch all projects (paginated).
-          2. Group by target, sum critical + high.
+          2. Group by target, sum critical + high, store ProjectDetail per file.
           3. Fetch all targets for display names.
           4. Filter to only targets with C > 0 or H > 0.
 

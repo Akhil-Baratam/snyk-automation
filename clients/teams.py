@@ -3,6 +3,15 @@ Microsoft Teams Incoming Webhook client.
 
 Sends Adaptive Card payloads, enforcing the 22 KB size limit by splitting
 into per-section cards when the payload would exceed it.
+
+Card envelope format used by Teams Incoming Webhooks:
+  {
+      "type": "message",
+      "attachments": [{
+          "contentType": "application/vnd.microsoft.card.adaptive",
+          "content": { <AdaptiveCard> }
+      }]
+  }
 """
 import json
 import logging
@@ -15,7 +24,7 @@ from utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
-_INTER_CARD_DELAY = 0.5  # seconds — respects Teams 4 req/s limit
+_INTER_CARD_DELAY = 0.5  # seconds between split sends (Teams: 4 req/s limit)
 
 
 class TeamsClient:
@@ -43,11 +52,16 @@ class TeamsClient:
 
     def send_card(self, card: dict) -> None:
         """
-        Send a single Adaptive Card.  If the serialised payload exceeds
-        TEAMS_CARD_SIZE_LIMIT_BYTES the caller should split it first.
+        Send a single card attachment.
+
+        card must be in the inner attachment format:
+          { "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": { <AdaptiveCard> } }
         """
-        self._post({"type": "message", "attachments": [card]})
-        logger.info("Teams card sent (%d bytes)", _card_bytes(card))
+        payload = {"type": "message", "attachments": [card]}
+        self._post(payload)
+        size = len(json.dumps(payload).encode("utf-8"))
+        logger.info("Teams card sent (%d bytes)", size)
 
     def send_or_split(
         self,
@@ -58,10 +72,10 @@ class TeamsClient:
     ) -> None:
         """
         Try to send a single consolidated card.  Fall back to per-section
-        cards if the combined payload is too large.
+        cards if the combined payload exceeds TEAMS_CARD_SIZE_LIMIT_BYTES.
         """
         full = _merge_cards(header_card, created_card, updated_card, flagged_card)
-        size = _card_bytes(full)
+        size = len(json.dumps({"type": "message", "attachments": [full]}).encode("utf-8"))
 
         if size <= config.TEAMS_CARD_SIZE_LIMIT_BYTES:
             logger.info("Card size %d bytes — within limit, sending single card", size)
@@ -75,9 +89,9 @@ class TeamsClient:
         )
         self.send_card(header_card)
         sections = [
-            (created_card, "Part 1 — New Tickets"),
-            (updated_card, "Part 2 — Count Changed"),
-            (flagged_card, "Part 3 — Flagged for Closure"),
+            (created_card, "Part 1/3 — New Tickets Created"),
+            (updated_card, "Part 2/3 — Count Changed"),
+            (flagged_card, "Part 3/3 — Flagged for Closure"),
         ]
         for card, label in sections:
             if card is None:
@@ -91,9 +105,9 @@ class TeamsClient:
     def send_failure_alert(self, phase: str, error: str, timestamp: str) -> None:
         """
         Minimal failure card — no imports from other phase modules.
-        Safe to call from any phase.
+        Safe to call from any phase; exceptions are caught internally.
         """
-        card = {
+        adaptive_card = {
             "type": "AdaptiveCard",
             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
             "version": "1.5",
@@ -126,7 +140,7 @@ class TeamsClient:
                 "type": "message",
                 "attachments": [{
                     "contentType": "application/vnd.microsoft.card.adaptive",
-                    "content": card,
+                    "content": adaptive_card,
                 }],
             })
             logger.info("Failure alert sent to Teams (phase=%s)", phase)
@@ -134,24 +148,50 @@ class TeamsClient:
             logger.error("Could not send failure alert to Teams: %s", exc)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _card_bytes(card: dict) -> int:
-    return len(json.dumps(card).encode("utf-8"))
-
+# ── Module-level helpers ──────────────────────────────────────────────────────
 
 def _merge_cards(*cards: dict | None) -> dict:
-    """Combine body blocks from multiple Adaptive Cards into one."""
+    """
+    Merge the body blocks of multiple Adaptive Card attachments into one.
+
+    Each card is in attachment format:
+      { "contentType": "...", "content": { "type": "AdaptiveCard", "body": [...] } }
+
+    The body lives at card["content"]["body"], not at the top level.
+    """
     merged_body: list[dict] = []
-    base: dict | None = None
+    base_content: dict | None = None
+
     for card in cards:
         if card is None:
             continue
-        if base is None:
-            base = dict(card)
-            merged_body.extend(card.get("body", []))
-        else:
-            merged_body.extend(card.get("body", []))
-    result = base or {}
-    result["body"] = merged_body
-    return result
+        content: dict = card.get("content", {})
+        body: list[dict] = content.get("body", [])
+        merged_body.extend(body)
+        if base_content is None:
+            base_content = dict(content)
+
+    if base_content is None:
+        return {}
+
+    merged_content = {**base_content, "body": merged_body}
+    return {
+        "contentType": "application/vnd.microsoft.card.adaptive",
+        "content": merged_content,
+    }
+
+
+def wrap_adaptive_card(body: list[dict]) -> dict:
+    """
+    Wrap a body block list into a complete card attachment dict.
+    Used by phases/notify.py.
+    """
+    return {
+        "contentType": "application/vnd.microsoft.card.adaptive",
+        "content": {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.5",
+            "body": body,
+        },
+    }
