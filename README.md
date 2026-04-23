@@ -1,0 +1,1 @@
+This is snyk-jira-automation project
