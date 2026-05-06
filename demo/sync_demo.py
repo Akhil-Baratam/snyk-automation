@@ -200,12 +200,11 @@ def sync_demo(jira, snyk, state: dict, targets_with_vulns: dict) -> dict:
             except Exception as e:
                 logger.warning("  [%s] Search failed (%s) — creating new", display_name[:35], type(e).__name__)
 
-            summary     = _build_summary(display_name, critical, high, today_str)
-            description = _build_adf_description(display_name, critical, high, projects, remote_url)
-
             if existing is None:
                 # ── CREATE ────────────────────────────────────────────────────
-                logger.info("  [%s] No ticket → creating", display_name[:35])
+                logger.info("  [%s] No ticket found → creating", display_name[:35])
+                summary     = _build_summary(display_name, critical, high, today_str)
+                description = _build_adf_description(display_name, critical, high, projects, remote_url)
                 ticket_key = jira.create_ticket(summary, description)
 
                 state.setdefault("targets", {})[target_id] = {
