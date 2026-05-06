@@ -1,13 +1,14 @@
 """
 Snyk API client.
 
-Strategy:
-  1. REST API — fetch all projects (target→project mapping, paginated, ~6 calls)
-  2. REST API — fetch all targets  (display names + remote URLs, paginated, ~2 calls)
-  3. V1  API  — GET /v1/org/{org}/project/{id} per project (~530 calls)
+Strategy (mirrors demo flow):
+  1. REST API — fetch all targets (display names + remote URLs, paginated)
+  2. REST API — GET /rest/orgs/{org}/projects?target_id={tid} per target
+               → per-target project list (target→project mapping)
+  3. V1  API  — GET /v1/org/{org}/project/{id} per project
                → reads issueCountsBySeverity.critical / .high directly
 
-Rate limit: ~1,620 req/min. 530 calls takes ~20s with 0.03s delay. Well within limits.
+Rate limit: ~1,620 req/min. Well within limits.
 """
 import logging
 import time
@@ -91,15 +92,6 @@ class SnykClient:
 
     # ── REST fetch methods ────────────────────────────────────────────────────
 
-    def fetch_all_projects(self) -> list[dict]:
-        """
-        GET /rest/orgs/{org}/projects
-        Returns project list with target relationships (no issue counts).
-        """
-        url    = f"{self._base}/rest/orgs/{self._org_id}/projects"
-        params = {"version": _REST_VERSION, "limit": config.SNYK_PAGE_SIZE}
-        return self._paginate(url, params, "projects")
-
     def fetch_all_targets(self) -> list[dict]:
         """
         GET /rest/orgs/{org}/targets
@@ -113,7 +105,6 @@ class SnykClient:
         """
         GET /rest/orgs/{org}/projects?target_id={target_id}
         Returns only projects belonging to a specific target.
-        Used by the demo to avoid fetching all 530 projects.
         """
         url    = f"{self._base}/rest/orgs/{self._org_id}/projects"
         params = {
@@ -238,11 +229,11 @@ class SnykClient:
 
     def get_aggregated_targets(self) -> tuple[list[SnykTarget], set[str]]:
         """
-        Full Phase 1 pipeline:
+        Full Phase 1 pipeline (mirrors demo flow):
 
-          Step 1 — GET /rest/orgs/{org}/projects   → project list (target mapping)
-          Step 2 — GET /rest/orgs/{org}/targets    → display names, all_target_ids
-          Step 3 — GET /v1/org/{org}/project/{id}  × N → issueCountsBySeverity
+          Step 1 — GET /rest/orgs/{org}/targets                       → display names, all_target_ids
+          Step 2 — GET /rest/orgs/{org}/projects?target_id={tid} × N  → per-target projects
+          Step 3 — GET /v1/org/{org}/project/{id}                × M  → issueCountsBySeverity
           Step 4 — Group by target, filter to C/H > 0
 
         Returns:
@@ -251,18 +242,25 @@ class SnykClient:
             all_target_ids = every target UUID in the org — used by Phase 2
             reverse check to distinguish "clean repo" vs "repo deleted from Snyk".
         """
-        logger.info("Step 1/3 — Fetching all projects")
-        projects = self.fetch_all_projects()
-        logger.info("Fetched %d projects total", len(projects))
-
-        logger.info("Step 2/3 — Fetching all targets")
+        logger.info("Step 1/3 — Fetching all targets")
         raw_targets    = self.fetch_all_targets()
         all_target_ids = {t["id"] for t in raw_targets if t.get("id")}
         target_lookup  = self.build_target_lookup(raw_targets)
         logger.info("Fetched %d targets total", len(all_target_ids))
 
+        logger.info("Step 2/3 — Fetching projects per target (%d targets)", len(all_target_ids))
+        all_projects: list[dict] = []
+        for tid in all_target_ids:
+            projects = self.fetch_projects_for_target(tid)
+            all_projects.extend(projects)
+        logger.info(
+            "Fetched %d projects total across %d target(s)",
+            len(all_projects),
+            len(all_target_ids),
+        )
+
         logger.info("Step 3/3 — Fetching issue counts per project")
-        target_map = self.build_target_map(projects)
+        target_map = self.build_target_map(all_projects)
 
         vuln_count = sum(1 for v in target_map.values() if v["critical"] > 0 or v["high"] > 0)
         logger.info("%d targets have C/H vulnerabilities", vuln_count)

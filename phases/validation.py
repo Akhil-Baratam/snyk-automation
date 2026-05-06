@@ -1,13 +1,8 @@
 """
 Phase 0 — Startup validation.
 
-Checks all external dependencies before any business logic runs.
-Fails fast with a Teams alert (where possible) if anything is broken.
-
-Alert policy (per spec §9):
-  - Teams failure → log only, cannot self-alert.
-  - All other failures → always attempt Teams alert (send_failure_alert
-    catches its own errors, so the attempt is always safe).
+Checks only the dependencies needed for the requested phase range.
+Fails fast with a Teams alert (where possible) on the first failure.
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -20,93 +15,91 @@ from clients.snyk import SnykClient
 from clients.teams import TeamsClient
 
 logger = logging.getLogger(__name__)
-
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def run_validation() -> None:
+def run_validation(end_phase: int = 3) -> None:
     """
-    Runs all 6 startup checks in order.
-    Raises RuntimeError on the first failure.
-    Attempts a Teams failure alert for every failure except Teams itself.
+    Validate external dependencies needed for phases 0..end_phase.
+
+      end_phase >= 0: Snyk
+      end_phase >= 2: Jira (incl. custom-field IDs) and S3
+      end_phase >= 3: Teams webhook
     """
-    teams_client = TeamsClient()
-    jira_client = JiraClient()
-    snyk_client = SnykClient()
+    teams = TeamsClient()
+    logger.info("Phase 0 — Startup validation (end_phase=%d)", end_phase)
 
-    # 1. Config completeness — guaranteed by config.py (exits on import if invalid)
-    logger.info("Phase 0 — Startup validation started")
+    # 1. Snyk — always
+    _check(SnykClient().check_org_reachability, "Snyk API", teams)
 
-    # 2. Snyk API reachability
-    logger.info("Phase 0 — checking Snyk API reachability")
-    _check(
-        snyk_client.check_org_reachability,
-        label="Snyk API",
-        teams_client=teams_client,
-        is_teams_check=False,
-    )
-    logger.info("Snyk API: OK")
+    # 2. Jira — phases 2+
+    if end_phase >= 2:
+        _validate_jira(teams)
+    else:
+        logger.info("Phase 0 — skipping Jira checks")
 
-    # 3. Jira API reachability
-    logger.info("Phase 0 — checking Jira API reachability")
-    _check(
-        jira_client.check_reachability,
-        label="Jira API",
-        teams_client=teams_client,
-        is_teams_check=False,
-    )
-    logger.info("Jira API: OK")
+    # 3. Teams — phases 3+
+    if end_phase >= 3:
+        if not config.TEAMS_WEBHOOK_URL:
+            raise RuntimeError("TEAMS_WEBHOOK_URL is not configured")
+        _check(teams.check_reachability, "Teams webhook", teams, is_teams=True)
+    else:
+        logger.info("Phase 0 — skipping Teams webhook check")
 
-    # 4. Jira custom fields exist
-    logger.info("Phase 0 — verifying Jira custom fields")
-    try:
-        missing = jira_client.validate_custom_fields()
-    except Exception as exc:
-        msg = f"Jira field validation failed: {exc}"
-        logger.error(msg)
-        _send_failure_alert(teams_client, "Phase 0", msg)
-        raise RuntimeError(msg) from exc
-
-    if missing:
-        msg = f"Jira custom fields not found in this instance: {', '.join(missing)}"
-        logger.error(msg)
-        _send_failure_alert(teams_client, "Phase 0", msg)
-        raise RuntimeError(msg)
-    logger.info("Jira custom fields: all 4 confirmed")
-
-    # 5. Teams webhook reachability (checked before S3 so we know if alerting works)
-    logger.info("Phase 0 — checking Teams webhook reachability")
-    _check(
-        teams_client.check_reachability,
-        label="Teams webhook",
-        teams_client=teams_client,
-        is_teams_check=True,  # cannot self-alert if Teams fails
-    )
-    logger.info("Teams webhook: OK")
-
-    # 6. S3 bucket access
-    logger.info("Phase 0 — checking S3 bucket access")
-    _check(
-        _check_s3_bucket,
-        label="S3 bucket",
-        teams_client=teams_client,
-        is_teams_check=False,
-    )
-    logger.info("S3 bucket: OK")
+    # 4. S3 — phases 2+
+    if end_phase >= 2:
+        if not config.S3_BUCKET_NAME:
+            raise RuntimeError("S3_BUCKET_NAME is not configured")
+        _check(_check_s3_bucket, "S3 bucket", teams)
+    else:
+        logger.info("Phase 0 — skipping S3 bucket check")
 
     logger.info("Phase 0 — Validation passed")
 
 
-def _check(func, label: str, teams_client: TeamsClient, is_teams_check: bool) -> None:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _validate_jira(teams: TeamsClient) -> None:
+    field_vars = {
+        "JIRA_FIELD_SNYK_PROJECT_ID":     config.JIRA_FIELD_SNYK_PROJECT_ID,
+        "JIRA_FIELD_SNYK_CRITICAL_COUNT": config.JIRA_FIELD_SNYK_CRITICAL_COUNT,
+        "JIRA_FIELD_SNYK_HIGH_COUNT":     config.JIRA_FIELD_SNYK_HIGH_COUNT,
+        "JIRA_FIELD_SNYK_LAST_SYNCED":    config.JIRA_FIELD_SNYK_LAST_SYNCED,
+    }
+    unset = [k for k, v in field_vars.items() if not v or v == "customfield_"]
+    if unset:
+        msg = f"Jira custom field IDs not configured: {', '.join(unset)}"
+        _alert(teams, msg)
+        raise RuntimeError(msg)
+
+    jira = JiraClient()
+    _check(jira.check_reachability, "Jira API", teams)
+
     try:
-        func()
+        missing = jira.validate_custom_fields()
+    except Exception as exc:
+        msg = f"Jira field validation failed: {exc}"
+        _alert(teams, msg)
+        raise RuntimeError(msg) from exc
+
+    if missing:
+        msg = f"Jira custom fields not found in this instance: {', '.join(missing)}"
+        _alert(teams, msg)
+        raise RuntimeError(msg)
+    logger.info("Jira custom fields: all 4 confirmed")
+
+
+def _check(fn, label: str, teams: TeamsClient, *, is_teams: bool = False) -> None:
+    logger.info("Phase 0 — checking %s", label)
+    try:
+        fn()
     except Exception as exc:
         msg = f"{label} check failed: {exc}"
         logger.error(msg)
-        if not is_teams_check:
-            # send_failure_alert catches its own exceptions — always safe to call
-            _send_failure_alert(teams_client, "Phase 0", msg)
+        if not is_teams:
+            _alert(teams, msg)
         raise RuntimeError(msg) from exc
+    logger.info("%s: OK", label)
 
 
 def _check_s3_bucket() -> None:
@@ -114,10 +107,9 @@ def _check_s3_bucket() -> None:
     if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
         kwargs["aws_access_key_id"] = config.AWS_ACCESS_KEY_ID
         kwargs["aws_secret_access_key"] = config.AWS_SECRET_ACCESS_KEY
-    s3 = boto3.client("s3", **kwargs)
-    s3.head_bucket(Bucket=config.S3_BUCKET_NAME)
+    boto3.client("s3", **kwargs).head_bucket(Bucket=config.S3_BUCKET_NAME)
 
 
-def _send_failure_alert(teams_client: TeamsClient, phase: str, error: str) -> None:
+def _alert(teams: TeamsClient, error: str) -> None:
     ts = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    teams_client.send_failure_alert(phase=phase, error=error, timestamp=ts)
+    teams.send_failure_alert(phase="Phase 0", error=error, timestamp=ts)

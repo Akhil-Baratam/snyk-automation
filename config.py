@@ -52,16 +52,19 @@ JIRA_API_TOKEN: str = _require("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY: str = _optional("JIRA_PROJECT_KEY", "PSUP")
 JIRA_TICKET_LABEL: str = _optional("JIRA_TICKET_LABEL", "snyk-jolt")
 JIRA_ISSUE_TYPE: str = _optional("JIRA_ISSUE_TYPE", "Task")
-JIRA_FIELD_SNYK_PROJECT_ID: str = _require("JIRA_FIELD_SNYK_PROJECT_ID")
-JIRA_FIELD_SNYK_CRITICAL_COUNT: str = _require("JIRA_FIELD_SNYK_CRITICAL_COUNT")
-JIRA_FIELD_SNYK_HIGH_COUNT: str = _require("JIRA_FIELD_SNYK_HIGH_COUNT")
-JIRA_FIELD_SNYK_LAST_SYNCED: str = _require("JIRA_FIELD_SNYK_LAST_SYNCED")
+JIRA_FIELD_SNYK_PROJECT_ID: str = _optional("JIRA_FIELD_SNYK_PROJECT_ID", "")
+JIRA_FIELD_SNYK_CRITICAL_COUNT: str = _optional("JIRA_FIELD_SNYK_CRITICAL_COUNT", "")
+JIRA_FIELD_SNYK_HIGH_COUNT: str = _optional("JIRA_FIELD_SNYK_HIGH_COUNT", "")
+JIRA_FIELD_SNYK_LAST_SYNCED: str = _optional("JIRA_FIELD_SNYK_LAST_SYNCED", "")
 
 # ── Teams ─────────────────────────────────────────────────────────────────────
-TEAMS_WEBHOOK_URL: str = _require("TEAMS_WEBHOOK_URL")
+# Required from Phase 3 onward. Optional at import so phase 0/1 can run.
+TEAMS_WEBHOOK_URL: str = _optional("TEAMS_WEBHOOK_URL", "")
 
 # ── AWS / S3 ──────────────────────────────────────────────────────────────────
-S3_BUCKET_NAME: str = _require("S3_BUCKET_NAME")
+# State-file storage. Optional for now — required only when phases 2+ need
+# delta detection. Phase 0/1 can run without an S3 bucket configured.
+S3_BUCKET_NAME: str = _optional("S3_BUCKET_NAME", "")
 S3_STATE_FILE_KEY: str = _optional("S3_STATE_FILE_KEY", "snyk-automation/snyk_state.json")
 AWS_REGION: str = _optional("AWS_REGION", "ap-south-1")
 # Optional — left blank when running under IAM role / instance profile

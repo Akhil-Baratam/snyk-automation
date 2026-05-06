@@ -1,51 +1,57 @@
 """
 Phase 1 — Snyk data collection.
 
-Fetches all org projects, aggregates per target, filters to C/H > 0,
-and writes the Phase 1 checkpoint state to S3.
-
-last_synced is intentionally NOT set here — Phase 2 owns that field
-and updates it after each successful Jira sync.
+Pure fetch + summary log. No state coupling — callers (main.py) own any
+state-file checkpoints.
 """
 import logging
+from pathlib import Path
 
-import state
 from clients.snyk import SnykClient
 from models.target import SnykTarget
 
 logger = logging.getLogger(__name__)
 
+_SUMMARY_FILE = Path(__file__).parent.parent / "logs" / "phase1_summary.txt"
 
-def run_collect(current_state: dict) -> tuple[list[SnykTarget], set[str]]:
+
+def run_collect() -> tuple[list[SnykTarget], set[str]]:
     """
-    Executes Phase 1.  Mutates current_state in-place and uploads a
-    checkpoint to S3 on success.
+    Fetch all targets, aggregate per-target C/H counts, log a summary,
+    and write the summary to logs/phase1_summary.txt.
 
     Returns:
         (targets_with_vulns, all_target_ids)
-        all_target_ids is the unfiltered full set — needed by Phase 2 reverse
-        check to distinguish "clean repo" from "deleted target".
-
-    Raises:
-        RuntimeError if Snyk data cannot be fetched after all retries.
+        all_target_ids is the unfiltered full set — needed by Phase 2's
+        reverse check to distinguish "clean repo" from "deleted target".
     """
-    logger.info("Phase 1 — Starting data collection")
-    snyk = SnykClient()
-
-    targets, all_target_ids = snyk.get_aggregated_targets()
-
-    current_state["total_count"] = len(targets)
-
-    for t in targets:
-        state.upsert_target(current_state, t.id, t.display_name)
-        # Do NOT set critical/high here.
-        # Phase 2 owns those fields and uses the existing state values
-        # as the delta baseline for change detection.
-
-    current_state["run_status"] = "partial"
-    state.upload_state(current_state)
-    logger.info(
-        "Phase 1 — Complete. total_count=%d. State uploaded to S3.",
-        len(targets),
-    )
+    logger.info("Phase 1 — Snyk data collection")
+    targets, all_target_ids = SnykClient().get_aggregated_targets()
+    _emit_summary(targets, all_target_ids)
     return targets, all_target_ids
+
+
+def _emit_summary(targets: list[SnykTarget], all_target_ids: set[str]) -> None:
+    ranked = sorted(
+        targets,
+        key=lambda t: (-t.critical, -t.high, t.display_name.lower()),
+    )
+    lines = [f"{t.display_name} - C{t.critical}H{t.high}" for t in ranked]
+
+    logger.info("=" * 78)
+    logger.info("Phase 1 Summary -- Targets with C/H vulnerabilities")
+    logger.info("=" * 78)
+    if lines:
+        for line in lines:
+            logger.info("  %s", line)
+    else:
+        logger.info("(no targets with critical or high vulnerabilities)")
+    logger.info("=" * 78)
+    logger.info(
+        "Total: %d/%d target(s) have C/H vulnerabilities",
+        len(targets), len(all_target_ids),
+    )
+
+    _SUMMARY_FILE.parent.mkdir(exist_ok=True)
+    _SUMMARY_FILE.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    logger.info("Phase 1 summary written to %s", _SUMMARY_FILE)
