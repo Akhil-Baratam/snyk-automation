@@ -39,6 +39,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Snyk -> Jira -> Teams Automation")
     parser.add_argument("--phase", default="0-3",
                         help="Phase range: '0', '0-1', '0-2', '0-3'. Default: 0-3")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Preview Phase 2/3 actions without writing to Jira or Teams")
     args = parser.parse_args()
 
     try:
@@ -49,7 +51,8 @@ def main() -> int:
 
     logger = setup_logger(debug=config.DEBUG_LOGGING)
     logger.info("=" * 78)
-    logger.info("Snyk Automation -- Phases %d-%d", start, end)
+    logger.info("Snyk Automation -- Phases %d-%d%s",
+                start, end, " (DRY RUN)" if args.dry_run else "")
     logger.info("=" * 78)
 
     # Lazy imports so the logger is configured first
@@ -60,13 +63,16 @@ def main() -> int:
     teams = TeamsClient()
 
     def _alert(phase: str, exc: Exception) -> None:
+        if args.dry_run:
+            logger.info("DRY-RUN -- skipping Teams failure alert for %s", phase)
+            return
         ts = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
         teams.send_failure_alert(phase=phase, error=str(exc), timestamp=ts)
 
     # ── Phase 0 ──────────────────────────────────────────────────────────────
     if start <= 0 <= end:
         try:
-            run_validation(end_phase=end)
+            run_validation(end_phase=end, dry_run=args.dry_run)
         except Exception as exc:
             logger.critical("Phase 0 failed: %s", exc)
             return 1
@@ -86,7 +92,7 @@ def main() -> int:
     if start <= 2 <= end:
         from phases.sync import run_sync
         try:
-            result = run_sync(targets)
+            result = run_sync(targets, dry_run=args.dry_run)
         except Exception as exc:
             logger.critical("Phase 2 failed: %s", exc, exc_info=True)
             _alert("Phase 2 -- Jira sync", exc)
@@ -96,7 +102,7 @@ def main() -> int:
     if start <= 3 <= end and result is not None:
         from phases.notify import run_notify
         try:
-            run_notify(result)
+            run_notify(result, dry_run=args.dry_run)
         except Exception as exc:
             logger.critical("Phase 3 failed: %s", exc, exc_info=True)
             return 1

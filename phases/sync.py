@@ -206,24 +206,26 @@ def _description_with_updated_vuln_table(existing: dict | None, target: SnykTarg
 
 # ── Phase 2 entry point ──────────────────────────────────────────────────────
 
-def run_sync(targets: list[SnykTarget]) -> RunResult:
+def run_sync(targets: list[SnykTarget], dry_run: bool = False) -> RunResult:
     jira   = JiraClient()
     gitlab = GitLabClient()
     cache  = _load_cache()
     today  = date.today()
     result = RunResult()
 
-    logger.info("Phase 2 -- Jira sync (%d targets)", len(targets))
+    logger.info("Phase 2 -- Jira sync (%d targets)%s",
+                len(targets), " [DRY RUN]" if dry_run else "")
 
     for target in targets:
         try:
-            _process_target(target, today, jira, gitlab, cache, result)
+            _process_target(target, today, jira, gitlab, cache, result, dry_run)
             result.processed_count += 1
         except Exception as exc:
             logger.error("[%s] sync failed: %s", target.display_name, exc, exc_info=True)
             result.error_count += 1
 
-    _save_cache(cache)
+    if not dry_run:
+        _save_cache(cache)
     skipped = result.processed_count - len(result.created) - len(result.changed)
     logger.info(
         "Phase 2 done -- created=%d changed=%d skipped=%d errors=%d",
@@ -239,6 +241,7 @@ def _process_target(
     gitlab: GitLabClient,
     cache: dict[str, str],
     result: RunResult,
+    dry_run: bool,
 ) -> None:
     token = _uuid_token(target.id)
     name  = target.display_name
@@ -258,13 +261,22 @@ def _process_target(
         due_date = (today + timedelta(days=due_in_days)).isoformat()
         summary = _build_summary(target, today)
         description = _build_description(target, last_commit)
-        key = jira.create_ticket(summary, description, priority, due_date)
-        cache[token] = key
-        _save_cache(cache)
-        logger.info("[%s] CREATED %s -- C%d H%d M%d L%d",
-                    name, key, target.critical, target.high, target.medium, target.low)
+
+        if dry_run:
+            key = "DRY-RUN"
+            ticket_url = ""
+            logger.info("[%s] DRY-RUN would CREATE -- C%d H%d priority=%s due=%s | summary=%s",
+                        name, target.critical, target.high, priority, due_date, summary)
+        else:
+            key = jira.create_ticket(summary, description, priority, due_date)
+            cache[token] = key
+            _save_cache(cache)
+            ticket_url = jira.ticket_url(key)
+            logger.info("[%s] CREATED %s -- C%d H%d M%d L%d",
+                        name, key, target.critical, target.high, target.medium, target.low)
+
         result.created.append(CreatedTicket(
-            target_name=name, ticket_key=key, ticket_url=jira.ticket_url(key),
+            target_name=name, ticket_key=key, ticket_url=ticket_url,
             critical=target.critical, high=target.high,
         ))
         return
@@ -277,9 +289,15 @@ def _process_target(
     old_c, old_h = old or (0, 0)
     new_summary = _build_summary(target, today)
     new_description = _description_with_updated_vuln_table(ticket.description, target)
-    jira.update_ticket(ticket.key, new_summary, new_description)
-    logger.info("[%s] %s -- CHANGED C%dH%d -> C%dH%d",
-                name, ticket.key, old_c, old_h, target.critical, target.high)
+
+    if dry_run:
+        logger.info("[%s] DRY-RUN would UPDATE %s -- C%dH%d -> C%dH%d | summary=%s",
+                    name, ticket.key, old_c, old_h, target.critical, target.high, new_summary)
+    else:
+        jira.update_ticket(ticket.key, new_summary, new_description)
+        logger.info("[%s] %s -- CHANGED C%dH%d -> C%dH%d",
+                    name, ticket.key, old_c, old_h, target.critical, target.high)
+
     result.changed.append(ChangedTicket(
         target_name=name, ticket_key=ticket.key, ticket_url=jira.ticket_url(ticket.key),
         old_critical=old_c, old_high=old_h,

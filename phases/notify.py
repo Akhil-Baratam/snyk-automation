@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 _INTER_CARD_DELAY = 0.5  # seconds between split sends (Teams: 4 req/s)
 
 
-def run_notify(result: RunResult) -> None:
+def run_notify(result: RunResult, dry_run: bool = False) -> None:
     header   = _build_header(result)
     sections = _build_sections(result)
 
@@ -31,17 +31,21 @@ def run_notify(result: RunResult) -> None:
     else:
         cards_body = _pack(header, sections)
 
-    teams = TeamsClient()
+    teams = TeamsClient() if not dry_run else None
     total = len(cards_body)
     for i, body in enumerate(cards_body, start=1):
         if total > 1:
             body = [_part_marker(i, total)] + body
         card = wrap_adaptive_card(body)
         _log_card(i, total, card)
-        teams.send_card(card)
-        if i < total:
-            time.sleep(_INTER_CARD_DELAY)
-    logger.info("Phase 3 -- notification sent (%d card(s))", total)
+        if dry_run:
+            logger.info("DRY-RUN -- card %d/%d not sent", i, total)
+        else:
+            teams.send_card(card)
+            if i < total:
+                time.sleep(_INTER_CARD_DELAY)
+    logger.info("Phase 3 -- %s (%d card(s))",
+                "DRY-RUN complete" if dry_run else "notification sent", total)
 
 
 # ── Body builders ────────────────────────────────────────────────────────────
@@ -126,10 +130,11 @@ def _size(body: list[dict]) -> int:
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 def _log_card(idx: int, total: int, card: dict) -> None:
-    payload = {"type": "message", "attachments": [card]}
-    pretty  = json.dumps(payload, indent=2)
-    logger.info("Card %d/%d (%d bytes):\n%s",
-                idx, total, len(pretty.encode("utf-8")), pretty)
+    payload    = {"type": "message", "attachments": [card]}
+    wire_bytes = len(json.dumps(payload).encode("utf-8"))
+    pretty     = json.dumps(payload, indent=2)
+    logger.info("Card %d/%d (%d bytes on wire):\n%s",
+                idx, total, wire_bytes, pretty)
 
 
 # ── Adaptive Card helpers ────────────────────────────────────────────────────
