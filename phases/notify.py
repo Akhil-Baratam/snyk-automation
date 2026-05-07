@@ -1,201 +1,172 @@
 """
-Phase 3 — Teams notification.
+Phase 3 -- Teams notification.
 
-Builds Adaptive Cards summarising the run (new tickets, count changes,
-flagged tickets), applies the 22 KB size guard, and finalises state in S3.
+Builds an Adaptive Card with a header plus up to two sections:
+  - New Tickets Created
+  - Existing Tickets -- Count Changed
 
-Card style per §14:
-  - Header: bold summary with counts
-  - New tickets section: red accent
-  - Count changed section: amber accent
-  - Flagged section: blue accent
-  - Partial-run warning: prominent red/orange block
+If the combined payload exceeds TEAMS_CARD_SIZE_LIMIT_BYTES, sections are
+greedily split across multiple cards. Each card's full JSON is logged
+before it's sent.
 """
+import json
 import logging
+import time
 from datetime import date
 
-import state
+import config
 from clients.teams import TeamsClient, wrap_adaptive_card
-from models.run_result import CreatedTicket, FlaggedTicket, RunResult, UpdatedTicket
+from models.run_result import RunResult
 
 logger = logging.getLogger(__name__)
+_INTER_CARD_DELAY = 0.5  # seconds between split sends (Teams: 4 req/s)
 
 
-def run_notify(result: RunResult, current_state: dict) -> None:
-    logger.info("Phase 3 — Building Teams card")
+def run_notify(result: RunResult) -> None:
+    header   = _build_header(result)
+    sections = _build_sections(result)
 
-    total = current_state.get("total_count", 0)
-    is_partial = result.processed_count < total
-    today_label = date.today().strftime("%d %b %Y")
-
-    header_card = _build_header_card(result, today_label, is_partial, total)
-    created_card = _build_created_card(result.created) if result.created else None
-    updated_card = _build_updated_card(result.updated) if result.updated else None
-    flagged_card = _build_flagged_card(result.flagged) if result.flagged else None
+    if not sections:
+        cards_body = [header + [_no_data_block()]]
+    else:
+        cards_body = _pack(header, sections)
 
     teams = TeamsClient()
-    teams.send_or_split(header_card, created_card, updated_card, flagged_card)
-    logger.info("Teams notification sent successfully")
-
-    current_state["run_status"] = "complete"
-    current_state["processed_count"] = result.processed_count
-    state.upload_state(current_state)
-    logger.info(
-        "State finalised. run_status=complete. Uploaded to S3."
-    )
-    logger.info(
-        "✓ Run complete. Processed %d/%d targets.",
-        result.processed_count,
-        total,
-    )
+    total = len(cards_body)
+    for i, body in enumerate(cards_body, start=1):
+        if total > 1:
+            body = [_part_marker(i, total)] + body
+        card = wrap_adaptive_card(body)
+        _log_card(i, total, card)
+        teams.send_card(card)
+        if i < total:
+            time.sleep(_INTER_CARD_DELAY)
+    logger.info("Phase 3 -- notification sent (%d card(s))", total)
 
 
-# ── Card builders ─────────────────────────────────────────────────────────────
+# ── Body builders ────────────────────────────────────────────────────────────
 
-def _build_header_card(
-    result: RunResult,
-    today_label: str,
-    is_partial: bool,
-    total: int,
-) -> dict:
-    body: list[dict] = [
-        {
-            "type": "TextBlock",
-            "text": f"📊 Snyk Automation — {today_label}",
-            "weight": "Bolder",
-            "size": "Large",
-            "wrap": True,
-        },
-        {
-            "type": "FactSet",
-            "facts": [
-                {"title": "🔴 New tickets created", "value": str(len(result.created))},
-                {"title": "🟡 Count changed",       "value": str(len(result.updated))},
-                {"title": "🔵 Flagged for review",  "value": str(len(result.flagged))},
-                {"title": "Targets processed",      "value": f"{result.processed_count}/{total}"},
-            ],
-        },
+def _build_header(result: RunResult) -> list[dict]:
+    today = date.today().strftime("%d %b %Y")
+    blocks: list[dict] = [
+        {"type": "TextBlock", "text": f"Snyk Automation -- {today}",
+         "weight": "Bolder", "size": "Large"},
+        {"type": "FactSet", "facts": [
+            {"title": "Created",   "value": str(len(result.created))},
+            {"title": "Changed",   "value": str(len(result.changed))},
+            {"title": "Processed", "value": str(result.processed_count)},
+        ]},
     ]
-
-    if is_partial:
-        body.append({
+    if result.error_count:
+        blocks.append({
             "type": "TextBlock",
-            "text": (
-                f"⚠️ WARNING: Partial run — only {result.processed_count}/{total} targets "
-                f"processed ({result.error_count} error(s)). Check logs."
-            ),
-            "color": "Attention",
-            "weight": "Bolder",
-            "wrap": True,
+            "text": f"{result.error_count} target(s) failed to process -- check logs",
+            "color": "Attention", "wrap": True, "spacing": "Small",
         })
-
-    if result.error_count > 0 and not is_partial:
-        body.append({
-            "type": "TextBlock",
-            "text": f"⚠️ {result.error_count} target(s) failed to process — see logs.",
-            "color": "Warning",
-            "wrap": True,
-        })
-
-    return wrap_adaptive_card(body)
+    return blocks
 
 
-def _build_created_card(items: list[CreatedTicket]) -> dict:
-    body: list[dict] = [
-        {
-            "type": "TextBlock",
-            "text": "🔴 New Tickets Created",
-            "weight": "Bolder",
-            "size": "Medium",
-            "color": "Attention",
-        },
-        _header_columns(["Project", "Ticket", "Severity"]),
+def _build_sections(result: RunResult) -> list[list[dict]]:
+    sections: list[list[dict]] = []
+    if result.created:
+        sections.append([
+            _heading("New Tickets Created", "Good"),
+            _table([4, 2, 2], ["Repository", "Ticket", "Severity"], [
+                [_cell(c.target_name),
+                 _cell(c.ticket_key, url=c.ticket_url),
+                 _cell(f"C{c.critical} H{c.high}")]
+                for c in result.created
+            ]),
+        ])
+    if result.changed:
+        sections.append([
+            _heading("Existing Tickets -- Count Changed", "Warning"),
+            _table([4, 2, 2, 2], ["Repository", "Ticket", "Old", "New"], [
+                [_cell(c.target_name),
+                 _cell(c.ticket_key, url=c.ticket_url),
+                 _cell(f"C{c.old_critical} H{c.old_high}"),
+                 _cell(f"C{c.new_critical} H{c.new_high}")]
+                for c in result.changed
+            ]),
+        ])
+    return sections
+
+
+# ── Packing (size-aware split) ───────────────────────────────────────────────
+
+def _pack(header: list[dict], sections: list[list[dict]]) -> list[list[dict]]:
+    """Greedy: combine header + sections into cards, opening a new card
+    whenever the next section would exceed the byte limit."""
+    limit = config.TEAMS_CARD_SIZE_LIMIT_BYTES
+    cards: list[list[dict]] = []
+    current = list(header)
+
+    for section in sections:
+        candidate = current + section
+        if _size(candidate) <= limit:
+            current = candidate
+        else:
+            cards.append(current)
+            if _size(section) > limit:
+                logger.warning(
+                    "Section size %d exceeds limit %d -- sending unsplit",
+                    _size(section), limit,
+                )
+            current = list(section)
+
+    cards.append(current)
+    return cards
+
+
+def _size(body: list[dict]) -> int:
+    payload = {"type": "message", "attachments": [wrap_adaptive_card(body)]}
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+def _log_card(idx: int, total: int, card: dict) -> None:
+    payload = {"type": "message", "attachments": [card]}
+    pretty  = json.dumps(payload, indent=2)
+    logger.info("Card %d/%d (%d bytes):\n%s",
+                idx, total, len(pretty.encode("utf-8")), pretty)
+
+
+# ── Adaptive Card helpers ────────────────────────────────────────────────────
+
+def _part_marker(i: int, total: int) -> dict:
+    return {"type": "TextBlock", "text": f"Part {i} of {total}",
+            "isSubtle": True, "weight": "Bolder", "spacing": "Small"}
+
+
+def _heading(text: str, color: str) -> dict:
+    return {"type": "TextBlock", "text": text, "weight": "Bolder",
+            "color": color, "spacing": "Large", "wrap": True}
+
+
+def _no_data_block() -> dict:
+    return {"type": "TextBlock", "text": "No new or changed tickets today.",
+            "isSubtle": True, "spacing": "Medium"}
+
+
+def _cell(text: str, url: str | None = None) -> dict:
+    inner = {"type": "TextBlock",
+             "text": f"[{text}]({url})" if url else text, "wrap": True}
+    return {"type": "TableCell", "items": [inner]}
+
+
+def _table(widths: list[int], headers: list[str], rows: list[list[dict]]) -> dict:
+    header_cells = [
+        {"type": "TableCell", "style": "emphasis",
+         "items": [{"type": "TextBlock", "text": h, "weight": "Bolder", "wrap": True}]}
+        for h in headers
     ]
-    for item in items:
-        body.append(_columns([
-            f"[{item.target_name}]({item.snyk_url})",
-            f"[{item.ticket_key}]({item.ticket_url})",
-            f"C{item.critical} H{item.high}",
-        ]))
-    return wrap_adaptive_card(body)
-
-
-def _build_updated_card(items: list[UpdatedTicket]) -> dict:
-    body: list[dict] = [
-        {
-            "type": "TextBlock",
-            "text": "🟡 Existing Tickets — Count Changed",
-            "weight": "Bolder",
-            "size": "Medium",
-            "color": "Warning",
-        },
-        _header_columns(["Project", "Ticket", "Old → New"]),
-    ]
-    for item in items:
-        body.append(_columns([
-            f"[{item.target_name}]({item.snyk_url})",
-            f"[{item.ticket_key}]({item.ticket_url})",
-            f"C{item.old_critical}H{item.old_high} → C{item.new_critical}H{item.new_high}",
-        ]))
-    return wrap_adaptive_card(body)
-
-
-def _build_flagged_card(items: list[FlaggedTicket]) -> dict:
-    _reason_labels = {
-        "project_deleted": "Project deleted/renamed in Snyk",
-        "vulns_resolved": "All C/H vulns resolved",
-    }
-    body: list[dict] = [
-        {
-            "type": "TextBlock",
-            "text": "🔵 Tickets to Review for Closure",
-            "weight": "Bolder",
-            "size": "Medium",
-            "color": "Accent",
-        },
-        {
-            "type": "TextBlock",
-            "text": "Please close these tickets manually if appropriate.",
-            "isSubtle": True,
-            "wrap": True,
-        },
-        _header_columns(["Project", "Ticket", "Reason"]),
-    ]
-    for item in items:
-        body.append(_columns([
-            item.target_name,
-            f"[{item.ticket_key}]({item.ticket_url})",
-            _reason_labels.get(item.reason, item.reason),
-        ]))
-    return wrap_adaptive_card(body)
-
-
-# ── Layout helpers ────────────────────────────────────────────────────────────
-
-def _header_columns(labels: list[str]) -> dict:
     return {
-        "type": "ColumnSet",
-        "style": "emphasis",
-        "columns": [
-            {
-                "type": "Column",
-                "width": "stretch" if i == 0 else "auto",
-                "items": [{"type": "TextBlock", "text": lbl, "weight": "Bolder", "wrap": True}],
-            }
-            for i, lbl in enumerate(labels)
-        ],
-    }
-
-
-def _columns(values: list[str]) -> dict:
-    return {
-        "type": "ColumnSet",
-        "columns": [
-            {
-                "type": "Column",
-                "width": "stretch" if i == 0 else "auto",
-                "items": [{"type": "TextBlock", "text": v, "wrap": True}],
-            }
-            for i, v in enumerate(values)
-        ],
+        "type": "Table",
+        "columns": [{"width": w} for w in widths],
+        "rows": [{"type": "TableRow", "style": "emphasis", "cells": header_cells}]
+              + [{"type": "TableRow", "cells": r} for r in rows],
+        "showGridLines": True,
+        "firstRowAsHeaders": True,
+        "spacing": "Small",
     }

@@ -1,13 +1,16 @@
 """
 Jira Cloud REST API v3 client.
 
-Handles ticket search, creation, and field updates.
-All requests use Basic auth (email:api_token, base64-encoded).
-All search calls specify an explicit fields= list to minimise point cost.
+Search by label + UUID-prefix token in summary. No project filter — tickets
+moved between Jira projects (PSUP -> RAIL etc.) are still found via labels.
+
+Endpoints (confirmed on smartsensebydigi.atlassian.net):
+  Search: POST /rest/api/3/search/jql
+  Create: POST /rest/api/3/issue          (singular)
+  Update: PUT  /rest/api/3/issue/{key}
 """
 import base64
 import logging
-from typing import Any
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -28,24 +31,25 @@ class JiraClient:
     @staticmethod
     def _build_session() -> requests.Session:
         session = requests.Session()
-        credentials = f"{config.JIRA_USER_EMAIL}:{config.JIRA_API_TOKEN}"
-        token = base64.b64encode(credentials.encode()).decode()
+        token = base64.b64encode(
+            f"{config.JIRA_USER_EMAIL}:{config.JIRA_API_TOKEN}".encode()
+        ).decode()
         session.headers.update({
             "Authorization": f"Basic {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
         })
         adapter = HTTPAdapter(max_retries=Retry(total=0))
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         return session
 
-    # ── Low-level HTTP ────────────────────────────────────────────────────────
+    # ── HTTP ──────────────────────────────────────────────────────────────────
 
-    def _get(self, path: str, params: dict | None = None) -> dict:
+    def _get(self, path: str) -> dict:
         url = f"{self._base}{path}"
         def _call() -> dict:
-            resp = self._session.get(url, params=params, timeout=30)
+            resp = self._session.get(url, timeout=30)
             resp.raise_for_status()
             return resp.json()
         return with_retry(_call)
@@ -54,7 +58,9 @@ class JiraClient:
         url = f"{self._base}{path}"
         def _call() -> dict:
             resp = self._session.post(url, json=body, timeout=30)
-            resp.raise_for_status()
+            if not resp.ok:
+                logger.error("POST %s -> %d: %s", path, resp.status_code, resp.text[:500])
+                resp.raise_for_status()
             return resp.json()
         return with_retry(_call)
 
@@ -62,156 +68,74 @@ class JiraClient:
         url = f"{self._base}{path}"
         def _call() -> None:
             resp = self._session.put(url, json=body, timeout=30)
-            resp.raise_for_status()
+            if not resp.ok:
+                logger.error("PUT %s -> %d: %s", path, resp.status_code, resp.text[:500])
+                resp.raise_for_status()
         with_retry(_call)
 
-    # ── Validation ────────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def check_reachability(self) -> dict:
         return self._get("/rest/api/3/myself")
 
-    def get_all_fields(self) -> list[dict]:
-        return self._get("/rest/api/3/field")  # type: ignore[return-value]
-
-    def validate_custom_fields(self) -> list[str]:
-        """Returns a list of field IDs from config that are absent in Jira."""
-        all_fields = self.get_all_fields()
-        existing_ids = {f["id"] for f in all_fields}
-        required = [
-            config.JIRA_FIELD_SNYK_PROJECT_ID,
-            config.JIRA_FIELD_SNYK_CRITICAL_COUNT,
-            config.JIRA_FIELD_SNYK_HIGH_COUNT,
-            config.JIRA_FIELD_SNYK_LAST_SYNCED,
-        ]
-        return [fid for fid in required if fid not in existing_ids]
-
-    # ── Search ────────────────────────────────────────────────────────────────
-
-    def search_issues(self, jql: str, fields: list[str]) -> list[dict]:
-        """Paginated JQL search. Returns raw issue dicts."""
-        results: list[dict] = []
-        start = 0
-        max_results = config.JIRA_PAGE_SIZE
-        field_str = ",".join(fields)
-
-        while True:
-            data = self._get(
-                "/rest/api/3/issue/search",
-                params={
-                    "jql": jql,
-                    "fields": field_str,
-                    "startAt": start,
-                    "maxResults": max_results,
-                },
-            )
-            issues: list[dict] = data.get("issues", [])
-            results.extend(issues)
-
-            total: int = data.get("total", 0)
-            start += len(issues)
-            if start >= total or not issues:
-                break
-
-        return results
-
-    def find_open_ticket_by_snyk_id(self, target_id: str) -> JiraTicket | None:
-        """Primary search: by snyk_project_id custom field."""
+    def find_open_ticket(self, uuid_token: str) -> JiraTicket | None:
+        """
+        Global search by label + UUID-prefix token in summary.
+        12-char hex token => ~280 trillion combinations: collision-free.
+        Also fetches the description so the caller can surgically update it.
+        """
         jql = (
-            f'"{config.JIRA_FIELD_SNYK_PROJECT_ID}" = "{target_id}"'
-            f' AND labels = "{config.JIRA_TICKET_LABEL}"'
-            f" AND statusCategory != Done"
+            f"labels = '{config.JIRA_TICKET_LABEL}' "
+            f"AND summary ~ '{uuid_token}' "
+            f"AND statusCategory != 'Done'"
         )
-        fields = [
-            "id", "key", "summary", "status",
-            config.JIRA_FIELD_SNYK_PROJECT_ID,
-            config.JIRA_FIELD_SNYK_CRITICAL_COUNT,
-            config.JIRA_FIELD_SNYK_HIGH_COUNT,
-        ]
-        issues = self.search_issues(jql, fields)
-        return self._issue_to_ticket(issues[0]) if issues else None
-
-    def find_open_ticket_by_name(self, display_name: str) -> JiraTicket | None:
-        """Fallback search: by label + summary text match."""
-        safe_name = display_name.replace('\\', '\\\\').replace('"', '\\"')
-        jql = (
-            f'labels = "{config.JIRA_TICKET_LABEL}"'
-            f' AND summary ~ "{safe_name}"'
-            f" AND statusCategory != Done"
-        )
-        fields = [
-            "id", "key", "summary", "status",
-            config.JIRA_FIELD_SNYK_PROJECT_ID,
-            config.JIRA_FIELD_SNYK_CRITICAL_COUNT,
-            config.JIRA_FIELD_SNYK_HIGH_COUNT,
-        ]
-        issues = self.search_issues(jql, fields)
-        return self._issue_to_ticket(issues[0]) if issues else None
-
-    def get_all_open_snyk_tickets(self) -> list[JiraTicket]:
-        """Reverse-check query: all open tickets with the snyk-jolt label."""
-        jql = (
-            f'labels = "{config.JIRA_TICKET_LABEL}"'
-            f" AND statusCategory != Done"
-        )
-        fields = [
-            "id", "key", "summary",
-            config.JIRA_FIELD_SNYK_PROJECT_ID,
-        ]
-        issues = self.search_issues(jql, fields)
-        logger.info("Reverse check: fetched %d open snyk-jolt tickets from Jira", len(issues))
-        return [self._issue_to_ticket(i) for i in issues]
-
-    # ── Write operations ──────────────────────────────────────────────────────
-
-    def create_ticket(
-        self,
-        summary: str,
-        description: dict,
-        custom_fields: dict[str, Any],
-    ) -> str:
-        """Creates a ticket and returns its key (e.g. 'PSUP-1042')."""
-        priority = "Critical" if custom_fields.get(config.JIRA_FIELD_SNYK_CRITICAL_COUNT, 0) > 0 else "High"
-        body: dict[str, Any] = {
-            "fields": {
-                "project": {"key": config.JIRA_PROJECT_KEY},
-                "issuetype": {"name": config.JIRA_ISSUE_TYPE},
-                "summary": summary,
-                "description": description,
-                "labels": [config.JIRA_TICKET_LABEL],
-                "priority": {"name": priority},
-                **custom_fields,
-            }
-        }
-        data = self._post("/rest/api/3/issue", body)
-        key: str = data["key"]
-        logger.info("Created Jira ticket %s", key)
-        return key
-
-    def update_fields(self, ticket_key: str, fields: dict[str, Any]) -> None:
-        self._put(f"/rest/api/3/issue/{ticket_key}", {"fields": fields})
-        logger.info("Updated fields on %s: %s", ticket_key, list(fields.keys()))
-
-    def backfill_snyk_project_id(self, ticket_key: str, target_id: str) -> None:
-        self.update_fields(
-            ticket_key,
-            {config.JIRA_FIELD_SNYK_PROJECT_ID: target_id},
-        )
-        logger.info("Backfilled snyk_project_id on %s → %s", ticket_key, target_id)
-
-    # ── URL builder ───────────────────────────────────────────────────────────
-
-    def ticket_url(self, key: str) -> str:
-        return f"{self._base}/browse/{key}"
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _issue_to_ticket(self, issue: dict) -> JiraTicket:
+        data = self._post("/rest/api/3/search/jql", {
+            "jql": jql,
+            "fields": ["summary", "status", "description"],
+        })
+        issues = data.get("issues", []) or []
+        if not issues:
+            return None
+        if len(issues) > 1:
+            logger.warning("Multiple tickets matched UUID %s: %s -- using first",
+                           uuid_token, [i.get("key") for i in issues])
+        issue = issues[0]
         f = issue.get("fields", {})
         return JiraTicket(
             key=issue["key"],
             summary=f.get("summary", ""),
             status=(f.get("status") or {}).get("name", ""),
-            snyk_project_id=f.get(config.JIRA_FIELD_SNYK_PROJECT_ID),
-            snyk_critical_count=f.get(config.JIRA_FIELD_SNYK_CRITICAL_COUNT),
-            snyk_high_count=f.get(config.JIRA_FIELD_SNYK_HIGH_COUNT),
+            description=f.get("description"),
         )
+
+    def create_ticket(
+        self,
+        summary: str,
+        description: dict,
+        priority: str = "High",
+        due_date: str | None = None,
+    ) -> str:
+        fields: dict = {
+            "project":     {"key":  config.JIRA_PROJECT_KEY},
+            "issuetype":   {"name": config.JIRA_ISSUE_TYPE},
+            "summary":     summary,
+            "description": description,
+            "labels":      [config.JIRA_TICKET_LABEL],
+            "priority":    {"name": priority},
+        }
+        if due_date:
+            fields["duedate"] = due_date
+        data = self._post("/rest/api/3/issue", {"fields": fields})
+        key: str = data["key"]
+        logger.info("Created Jira ticket %s (priority=%s, due=%s)", key, priority, due_date or "-")
+        return key
+
+    def update_ticket(self, ticket_key: str, summary: str, description: dict) -> None:
+        """Update both summary and description in a single PUT."""
+        self._put(f"/rest/api/3/issue/{ticket_key}", {
+            "fields": {"summary": summary, "description": description},
+        })
+        logger.info("Updated %s (summary + description)", ticket_key)
+
+    def ticket_url(self, key: str) -> str:
+        return f"{self._base}/browse/{key}"

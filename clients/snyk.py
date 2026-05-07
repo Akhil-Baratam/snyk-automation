@@ -189,10 +189,14 @@ class SnykClient:
                 counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
 
             if target_id not in target_map:
-                target_map[target_id] = {"critical": 0, "high": 0, "projects": []}
+                target_map[target_id] = {
+                    "critical": 0, "high": 0, "medium": 0, "low": 0, "projects": [],
+                }
 
             target_map[target_id]["critical"] += counts["critical"]
             target_map[target_id]["high"]     += counts["high"]
+            target_map[target_id]["medium"]   += counts["medium"]
+            target_map[target_id]["low"]      += counts["low"]
 
             # Only include in description table if this file has C or H vulns
             if (counts["critical"] > 0 or counts["high"] > 0) and proj_name:
@@ -276,6 +280,8 @@ class SnykClient:
                     display_name = lookup.get("display_name") or f"target-{tid[:8]}",
                     critical     = data["critical"],
                     high         = data["high"],
+                    medium       = data["medium"],
+                    low          = data["low"],
                     remote_url   = lookup.get("remote_url", ""),
                     projects     = data["projects"],
                 )

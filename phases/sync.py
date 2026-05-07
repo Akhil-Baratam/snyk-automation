@@ -1,92 +1,96 @@
 """
-Phase 2 — Jira sync.
+Phase 2 -- Jira sync.
 
-11.1 Forward check  — for every target with C/H vulns, ensure an open Jira
-                       ticket exists and reflects the current counts.
-11.2 Reverse check  — scan all open snyk-jolt tickets and flag any whose
-                       target is gone or clean in Snyk.
+Per target:
+  1. Same-day cache hit (logs/today_created.json) -> skip (idempotency)
+  2. JQL by label + UUID-prefix token in summary
+  3. No ticket            -> create (fresh summary + description; GitLab metadata)
+     Counts match         -> skip
+     Counts differ        -> rewrite summary + replace Table 1 only
+                             (preserves any human edits in Table 2)
+
+UUID token: first 12 hex chars of target.id (no dashes).
+~280 trillion combinations -- collision-free.
 """
+import json
 import logging
+import re
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import config
-import state
+from clients.gitlab import GitLabClient
 from clients.jira import JiraClient
-from models.run_result import (
-    CreatedTicket,
-    FlaggedTicket,
-    RunResult,
-    UpdatedTicket,
-)
-from models.target import ProjectDetail, SnykTarget
+from models.run_result import ChangedTicket, CreatedTicket, RunResult
+from models.target import SnykTarget
 
 logger = logging.getLogger(__name__)
 
-
-# ── URL helpers ───────────────────────────────────────────────────────────────
-
-def _snyk_target_url(target_id: str) -> str:
-    """Snyk UI URL for a target (project page), using org slug when available."""
-    slug = config.SNYK_ORG_SLUG
-    if slug:
-        return f"https://app.snyk.io/org/{slug}/project/{target_id}"
-    ui_base = config.SNYK_API_BASE_URL.replace("api.snyk.io", "app.snyk.io").rstrip("/")
-    return f"{ui_base}/org/{config.SNYK_ORG_ID}/project/{target_id}"
+_CACHE_FILE = Path(__file__).parent.parent / "logs" / "today_created.json"
+_COUNTS_RE  = re.compile(r"\[\s*C(\d+)\s+H(\d+)\s+as on", re.IGNORECASE)
+_FIVE_YEARS = timedelta(days=365 * 5)
 
 
-def _snyk_project_url(project_id: str) -> str:
-    """Snyk UI URL for a specific project (file-level scan), using org slug when available."""
-    slug = config.SNYK_ORG_SLUG
-    if slug:
-        return f"https://app.snyk.io/org/{slug}/project/{project_id}"
-    return f"https://app.snyk.io/org/{config.SNYK_ORG_ID}/project/{project_id}"
+def _uuid_token(target_id: str) -> str:
+    return target_id.replace("-", "")[:12]
 
 
-def _gitlab_file_url(remote_url: str, file_path: str) -> str:
-    """GitLab blob URL for a specific file on the configured default branch."""
-    base = remote_url.rstrip("/")
-    branch = config.GITLAB_DEFAULT_BRANCH
-    return f"{base}/blob/{branch}/{file_path}"
+# ── Cache (same-day idempotency) ─────────────────────────────────────────────
+
+def _load_cache() -> dict[str, str]:
+    if not _CACHE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if data.get("date") != date.today().isoformat():
+        return {}
+    return data.get("created", {}) or {}
 
 
-# ── Jira ticket content builders ──────────────────────────────────────────────
-
-def _build_summary(display_name: str, critical: int, high: int, today: str) -> str:
-    """
-    Production format:
-        Snyk Vulnerabilities Check Repo Name:{name} [ C{c} H{h} as on {MM/DD/YY}]
-    """
-    parts = today.split("-")          # ["2026", "04", "23"]
-    mm_dd_yy = f"{parts[1]}/{parts[2]}/{parts[0][2:]}"   # "04/23/26"
-    return (
-        f"Snyk Vulnerabilities Check Repo Name:{display_name}"
-        f" [ C{critical} H{high} as on {mm_dd_yy}]"
+def _save_cache(created: dict[str, str]) -> None:
+    _CACHE_FILE.parent.mkdir(exist_ok=True)
+    _CACHE_FILE.write_text(
+        json.dumps({"date": date.today().isoformat(), "created": created}, indent=2),
+        encoding="utf-8",
     )
 
 
-# ── ADF node factories ────────────────────────────────────────────────────────
+# ── Summary build / parse ────────────────────────────────────────────────────
+
+def _build_summary(target: SnykTarget, today: date) -> str:
+    return (
+        f"Snyk Vulnerabilities Check Repo Name:{target.display_name} "
+        f"[snyk:{_uuid_token(target.id)}] "
+        f"[ C{target.critical} H{target.high} as on {today.strftime('%m/%d/%y')}]"
+    )
+
+
+def _parse_counts(summary: str) -> tuple[int, int] | None:
+    m = _COUNTS_RE.search(summary)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+# ── ADF node helpers ─────────────────────────────────────────────────────────
 
 def _text(t: str, bold: bool = False) -> dict:
-    node: dict = {"type": "text", "text": t}
+    n: dict = {"type": "text", "text": t}
     if bold:
-        node["marks"] = [{"type": "strong"}]
-    return node
+        n["marks"] = [{"type": "strong"}]
+    return n
 
 
-def _link_node(label: str, url: str) -> dict:
-    return {
-        "type": "text",
-        "text": label,
-        "marks": [{"type": "link", "attrs": {"href": url}}],
-    }
+def _link(url: str) -> dict:
+    return {"type": "text", "text": url, "marks": [{"type": "link", "attrs": {"href": url}}]}
 
 
-def _cell(nodes: list[dict], is_header: bool = False) -> dict:
-    cell_type = "tableHeader" if is_header else "tableCell"
-    return {
-        "type": cell_type,
-        "attrs": {},
-        "content": [{"type": "paragraph", "content": nodes}],
-    }
+def _inline_card(url: str) -> dict:
+    return {"type": "inlineCard", "attrs": {"url": url}}
+
+
+def _cell(nodes: list[dict]) -> dict:
+    return {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph", "content": nodes}]}
 
 
 def _row(cells: list[dict]) -> dict:
@@ -94,291 +98,190 @@ def _row(cells: list[dict]) -> dict:
 
 
 def _table(rows: list[dict]) -> dict:
+    return {"type": "table",
+            "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+            "content": rows}
+
+
+def _snyk_project_url(project_id: str) -> str:
+    slug = config.SNYK_ORG_SLUG or config.SNYK_ORG_ID
+    return f"https://app.snyk.io/org/{slug}/project/{project_id}"
+
+
+def _gitlab_file_url(remote_url: str, file_name: str) -> str:
+    base = remote_url.rstrip("/")
+    last = file_name.split("/")[-1]
+    verb = "tree" if "." not in last else "blob"
+    return f"{base}/{verb}/{config.GITLAB_DEFAULT_BRANCH}/{file_name}"
+
+
+# ── Description tables ───────────────────────────────────────────────────────
+
+def _build_vuln_table_rows(target: SnykTarget) -> list[dict]:
+    """Table 1 -- two columns: Snyk vulnerability | Gitlab link."""
+    rows = [_row([
+        _cell([_text("Snyk vulnerability", bold=True)]),
+        _cell([_text("Gitlab link",        bold=True)]),
+    ])]
+    for p in target.projects:
+        snyk_nodes = [_link(_snyk_project_url(p.project_id))] if p.project_id else [_text("-")]
+        gitlab_nodes = (
+            [_inline_card(_gitlab_file_url(target.remote_url, p.name))]
+            if (target.remote_url and p.name) else [_text("-")]
+        )
+        rows.append(_row([_cell(snyk_nodes), _cell(gitlab_nodes)]))
+    if not target.projects:
+        rows.append(_row([_cell([_text("-")]), _cell([_text("-")])]))
+    return rows
+
+
+def _format_date(dt: datetime) -> str:
+    return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+
+
+def _active_in_production(last_commit: datetime | None) -> str:
+    if last_commit is None:
+        return "-"
+    if last_commit.tzinfo is None:
+        last_commit = last_commit.replace(tzinfo=timezone.utc)
+    return "Active" if last_commit > datetime.now(tz=timezone.utc) - _FIVE_YEARS else "Inactive"
+
+
+def _build_metadata_table_rows(target: SnykTarget, last_commit: datetime | None) -> list[dict]:
+    """Table 2 -- repository key/value details."""
+    repo_url_nodes = [_inline_card(target.remote_url)] if target.remote_url else [_text("-")]
+    last_commit_str = _format_date(last_commit) if last_commit else "-"
+    severity = (
+        f"Critical: {target.critical}, High: {target.high}, "
+        f"Medium: {target.medium}, Low: {target.low}"
+    )
+    pairs: list[tuple[str, list[dict]]] = [
+        ("Repository Name",                                   [_text(target.display_name)]),
+        ("Repo URL",                                          repo_url_nodes),
+        ("Last Commit Date",                                  [_text(last_commit_str)]),
+        ("Active in Production",                              [_text(_active_in_production(last_commit))]),
+        ("Critical for Enterprise",                           [_text("-")]),
+        ("Facing Type",                                       [_text("-")]),
+        ("Service Name",                                      [_text("-")]),
+        ("Owner / Maintainer",                                [_text("-")]),
+        ("Snyk Vulnerabilities (Count) (For all severities)", [_text(str(target.total))]),
+        ("Severity Breakdown",                                [_text(severity)]),
+        ("Mitigation Status",                                 [_text("-")]),
+        ("Notes / Comments",                                  [_text("-")]),
+    ]
+    rows = [_row([
+        _cell([_text("Field",                bold=True)]),
+        _cell([_text("Description / Example", bold=True)]),
+    ])]
+    for label, nodes in pairs:
+        rows.append(_row([_cell([_text(label, bold=True)]), _cell(nodes)]))
+    return rows
+
+
+def _build_description(target: SnykTarget, last_commit: datetime | None) -> dict:
     return {
-        "type": "table",
-        "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
-        "content": rows,
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {"type": "paragraph", "content": [_text("Snyk Vulnerability:", bold=True)]},
+            _table(_build_vuln_table_rows(target)),
+            _table(_build_metadata_table_rows(target, last_commit)),
+        ],
     }
 
 
-# ── ADF description ───────────────────────────────────────────────────────────
-
-def _build_adf_description(target: SnykTarget) -> dict:
+def _description_with_updated_vuln_table(existing: dict | None, target: SnykTarget) -> dict:
     """
-    ADF document matching §13 + production ticket format.
-
-    Table 1 — Snyk vulnerability per file (C/H > 0 files only)
-      Snyk vulnerability | Gitlab link | Severity Breakdown
-
-    Table 2 — Repository key-value details
-      Field | Description / Example
+    Replace just Table 1 in `existing`. Preserves Table 2 (and any human edits
+    to Mitigation Status / Notes / Comments).
+    Falls back to a fresh description if `existing` is missing or unrecognised.
     """
-    content: list[dict] = []
-
-    # ── Table 1: per-file snyk + gitlab links ─────────────────────────────────
-    header_row_1 = _row([
-        _cell([_text("Snyk vulnerability", bold=True)], is_header=True),
-        _cell([_text("Gitlab link",        bold=True)], is_header=True),
-        _cell([_text("Severity Breakdown", bold=True)], is_header=True),
-    ])
-
-    file_rows: list[dict] = []
-    for p in target.projects:
-        snyk_url   = _snyk_project_url(p.project_id)
-        gitlab_url = _gitlab_file_url(target.remote_url, p.name) if target.remote_url else ""
-        severity   = f"C{p.critical} H{p.high} M{p.medium} L{p.low}"
-
-        file_rows.append(_row([
-            _cell([_link_node(snyk_url, snyk_url)] if snyk_url else [_text("—")]),
-            _cell([_link_node(gitlab_url, gitlab_url)] if gitlab_url else [_text("—")]),
-            _cell([_text(severity)]),
-        ]))
-
-    if not file_rows:
-        file_rows = [_row([
-            _cell([_text("No C/H vulnerability data available")]),
-            _cell([_text("—")]),
-            _cell([_text("—")]),
-        ])]
-
-    content.append({
-        "type": "paragraph",
-        "content": [_text("Snyk Vulnerability:", bold=True)],
-    })
-    content.append(_table([header_row_1, *file_rows]))
-
-    # ── Table 2: repository key-value details ─────────────────────────────────
-    repo_url_nodes = (
-        [_link_node(target.remote_url, target.remote_url)]
-        if target.remote_url else [_text("—")]
-    )
-    total_projects = len(target.projects)
-
-    kv_rows: list[tuple[str, list[dict]]] = [
-        ("Repository Name",   [_text(target.display_name)]),
-        ("Repo URL",          repo_url_nodes),
-        ("Last Commit Date",  [_text("-")]),
-        ("Active in Production", [_text("")]),
-        ("Critical for Enterprise", [_text("-")]),
-        ("Facing Type",       [_text("")]),
-        ("Service Name",      [_text("")]),
-        ("Owner / Maintainer", [_text("")]),
-        ("Snyk Vulnerabilities (Count) (For all severities)", [_text(str(total_projects))]),
-        ("Severity Breakdown", [_text(f"Critical:{target.critical}, High:{target.high}")]),
-        ("Mitigation Status", [_text("-")]),
-        ("Notes / Comments",  [_text("")]),
-    ]
-
-    kv_table_rows = [
-        _row([
-            _cell([_text("Field",                bold=True)], is_header=True),
-            _cell([_text("Description / Example", bold=True)], is_header=True),
-        ])
-    ] + [
-        _row([
-            _cell([_text(field, bold=True)]),
-            _cell(value_nodes),
-        ])
-        for field, value_nodes in kv_rows
-    ]
-
-    content.append(_table(kv_table_rows))
-
-    return {"type": "doc", "version": 1, "content": content}
+    if existing and isinstance(existing.get("content"), list):
+        for elem in existing["content"]:
+            if elem.get("type") == "table":
+                elem["content"] = _build_vuln_table_rows(target)
+                return existing
+    return _build_description(target, last_commit=None)
 
 
-# ── Phase 2 entry point ───────────────────────────────────────────────────────
+# ── Phase 2 entry point ──────────────────────────────────────────────────────
 
-def run_sync(
-    targets: list[SnykTarget],
-    all_target_ids: set[str],
-    current_state: dict,
-) -> RunResult:
-    """
-    Runs forward check (§11.1) then reverse check (§11.2).
-    Mutates current_state in-place.
-    Returns a RunResult accumulator consumed by Phase 3.
-    """
-    jira = JiraClient()
+def run_sync(targets: list[SnykTarget]) -> RunResult:
+    jira   = JiraClient()
+    gitlab = GitLabClient()
+    cache  = _load_cache()
+    today  = date.today()
     result = RunResult()
-    today = state.today_str()
 
-    # ── 11.1 Forward check ────────────────────────────────────────────────────
-    logger.info("Phase 2 — Forward check started (%d targets)", len(targets))
-
-    target_ids_with_vulns: set[str] = {t.id for t in targets}
+    logger.info("Phase 2 -- Jira sync (%d targets)", len(targets))
 
     for target in targets:
         try:
-            _forward_check_target(target, jira, current_state, result, today)
+            _process_target(target, today, jira, gitlab, cache, result)
             result.processed_count += 1
         except Exception as exc:
-            logger.error(
-                "[%s] Forward check failed: %s", target.display_name, exc, exc_info=True
-            )
+            logger.error("[%s] sync failed: %s", target.display_name, exc, exc_info=True)
             result.error_count += 1
 
-    skipped = result.processed_count - len(result.created) - len(result.updated)
+    _save_cache(cache)
+    skipped = result.processed_count - len(result.created) - len(result.changed)
     logger.info(
-        "Phase 2 forward check — complete. created=%d updated=%d skipped=%d errors=%d",
-        len(result.created),
-        len(result.updated),
-        skipped,
-        result.error_count,
+        "Phase 2 done -- created=%d changed=%d skipped=%d errors=%d",
+        len(result.created), len(result.changed), skipped, result.error_count,
     )
-
-    # ── 11.2 Reverse check ────────────────────────────────────────────────────
-    logger.info("Phase 2 — Reverse check started")
-    open_tickets = jira.get_all_open_snyk_tickets()
-
-    for ticket in open_tickets:
-        snyk_id = ticket.snyk_project_id
-        if not snyk_id:
-            logger.warning(
-                "[%s] Missing snyk_project_id field — cannot reverse-check", ticket.key
-            )
-            continue
-
-        ticket_url  = jira.ticket_url(ticket.key)
-        target_name = ticket.summary
-
-        if snyk_id not in all_target_ids:
-            # Target UUID absent from the targets API — deleted or renamed
-            result.flagged.append(FlaggedTicket(
-                target_name=target_name,
-                ticket_key=ticket.key,
-                ticket_url=ticket_url,
-                reason="project_deleted",
-            ))
-            logger.info("[%s] %s — flagged: project_deleted", target_name, ticket.key)
-
-        elif snyk_id not in target_ids_with_vulns:
-            # Target exists in Snyk but has zero C/H vulns (filtered out in Phase 1)
-            result.flagged.append(FlaggedTicket(
-                target_name=target_name,
-                ticket_key=ticket.key,
-                ticket_url=ticket_url,
-                reason="vulns_resolved",
-            ))
-            logger.info("[%s] %s — flagged: vulns_resolved", target_name, ticket.key)
-        # else: ticket correctly open — forward check already handled it
-
-    logger.info("Phase 2 reverse check — complete. flagged=%d", len(result.flagged))
     return result
 
 
-# ── Forward-check helpers ─────────────────────────────────────────────────────
-
-def _forward_check_target(
+def _process_target(
     target: SnykTarget,
+    today: date,
     jira: JiraClient,
-    current_state: dict,
+    gitlab: GitLabClient,
+    cache: dict[str, str],
     result: RunResult,
-    today: str,
 ) -> None:
-    state_entry = current_state["targets"].get(target.id, {})
+    token = _uuid_token(target.id)
+    name  = target.display_name
 
-    # Step A — idempotency guard
-    if state_entry.get("created_today"):
-        logger.info("[%s] Skipping — ticket already created in this run", target.display_name)
+    if token in cache:
+        logger.info("[%s] cache hit %s -- skipping", name, cache[token])
         return
 
-    # Step B — search for existing open ticket
-    ticket = jira.find_open_ticket_by_snyk_id(target.id)
+    ticket = jira.find_open_ticket(token)
 
     if ticket is None:
-        logger.info("[%s] No ticket via primary search — trying name-based fallback", target.display_name)
-        ticket = jira.find_open_ticket_by_name(target.display_name)
-        if ticket is not None:
-            logger.info("[%s] Fallback found %s — backfilling snyk_project_id", target.display_name, ticket.key)
-            jira.backfill_snyk_project_id(ticket.key, target.id)
-
-    # Step C — branch on ticket existence and count delta
-    if ticket is None:
-        _create_ticket(target, jira, current_state, result, today)
-    else:
-        old_c = state_entry.get("critical", 0)
-        old_h = state_entry.get("high", 0)
-        if target.critical != old_c or target.high != old_h:
-            _update_ticket(target, ticket.key, old_c, old_h, jira, current_state, result, today)
+        last_commit = gitlab.get_last_commit_date(target.remote_url)
+        if target.critical > 0:
+            priority, due_in_days = "Highest", 30
         else:
-            current_state["targets"].setdefault(target.id, {})["last_synced"] = today
-            logger.info(
-                "[%s] Ticket %s — SAME counts C%dH%d → skip",
-                target.display_name, ticket.key, target.critical, target.high,
-            )
+            priority, due_in_days = "High", 60
+        due_date = (today + timedelta(days=due_in_days)).isoformat()
+        summary = _build_summary(target, today)
+        description = _build_description(target, last_commit)
+        key = jira.create_ticket(summary, description, priority, due_date)
+        cache[token] = key
+        _save_cache(cache)
+        logger.info("[%s] CREATED %s -- C%d H%d M%d L%d",
+                    name, key, target.critical, target.high, target.medium, target.low)
+        result.created.append(CreatedTicket(
+            target_name=name, ticket_key=key, ticket_url=jira.ticket_url(key),
+            critical=target.critical, high=target.high,
+        ))
+        return
 
+    old = _parse_counts(ticket.summary)
+    if old == (target.critical, target.high):
+        logger.info("[%s] %s -- unchanged C%d H%d", name, ticket.key, target.critical, target.high)
+        return
 
-def _create_ticket(
-    target: SnykTarget,
-    jira: JiraClient,
-    current_state: dict,
-    result: RunResult,
-    today: str,
-) -> None:
-    summary     = _build_summary(target.display_name, target.critical, target.high, today)
-    description = _build_adf_description(target)
-    custom_fields = {
-        config.JIRA_FIELD_SNYK_PROJECT_ID:     target.id,
-        config.JIRA_FIELD_SNYK_CRITICAL_COUNT: target.critical,
-        config.JIRA_FIELD_SNYK_HIGH_COUNT:     target.high,
-        config.JIRA_FIELD_SNYK_LAST_SYNCED:    today,
-    }
-    key = jira.create_ticket(summary, description, custom_fields)
-    logger.info("[%s] NO ticket found → created %s", target.display_name, key)
-
-    entry = state.upsert_target(current_state, target.id, target.display_name)
-    entry["jira_ticket"]   = key
-    entry["created_today"] = True
-    entry["critical"]      = target.critical
-    entry["high"]          = target.high
-    entry["last_changed"]  = today
-    entry["last_synced"]   = today
-
-    result.created.append(CreatedTicket(
-        target_name=target.display_name,
-        ticket_key=key,
-        ticket_url=jira.ticket_url(key),
-        snyk_url=_snyk_target_url(target.id),
-        critical=target.critical,
-        high=target.high,
-    ))
-
-
-def _update_ticket(
-    target: SnykTarget,
-    ticket_key: str,
-    old_c: int,
-    old_h: int,
-    jira: JiraClient,
-    current_state: dict,
-    result: RunResult,
-    today: str,
-) -> None:
-    # Update only the 3 machine-managed fields; never touch summary or description
-    jira.update_fields(ticket_key, {
-        config.JIRA_FIELD_SNYK_CRITICAL_COUNT: target.critical,
-        config.JIRA_FIELD_SNYK_HIGH_COUNT:     target.high,
-        config.JIRA_FIELD_SNYK_LAST_SYNCED:    today,
-    })
-    logger.info(
-        "[%s] Ticket %s — CHANGED C%dH%d→C%dH%d → updating fields",
-        target.display_name, ticket_key, old_c, old_h, target.critical, target.high,
-    )
-
-    entry = current_state["targets"].setdefault(target.id, {})
-    entry["critical"]     = target.critical
-    entry["high"]         = target.high
-    entry["last_changed"] = today
-    entry["last_synced"]  = today
-
-    result.updated.append(UpdatedTicket(
-        target_name=target.display_name,
-        ticket_key=ticket_key,
-        ticket_url=jira.ticket_url(ticket_key),
-        old_critical=old_c,
-        old_high=old_h,
-        new_critical=target.critical,
-        new_high=target.high,
-        snyk_url=_snyk_target_url(target.id),
+    old_c, old_h = old or (0, 0)
+    new_summary = _build_summary(target, today)
+    new_description = _description_with_updated_vuln_table(ticket.description, target)
+    jira.update_ticket(ticket.key, new_summary, new_description)
+    logger.info("[%s] %s -- CHANGED C%dH%d -> C%dH%d",
+                name, ticket.key, old_c, old_h, target.critical, target.high)
+    result.changed.append(ChangedTicket(
+        target_name=name, ticket_key=ticket.key, ticket_url=jira.ticket_url(ticket.key),
+        old_critical=old_c, old_high=old_h,
+        new_critical=target.critical, new_high=target.high,
     ))

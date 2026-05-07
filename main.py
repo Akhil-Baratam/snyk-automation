@@ -2,14 +2,20 @@
 Entry point — orchestrates the four-phase pipeline.
 
 Usage:
-  python main.py                # All phases (0-3) — needs S3 state
+  python main.py                # All phases (0-3)
   python main.py --phase 0      # Validation only
-  python main.py --phase 0-1    # Validation + Snyk fetch (no state, no Jira write)
-  python main.py --phase 0-2    # + Jira sync (needs state)
-  python main.py --phase 0-3    # All phases
+  python main.py --phase 0-1    # Validation + Snyk fetch
+  python main.py --phase 0-2    # + Jira sync
+  python main.py --phase 0-3    # + Teams notification
+
+Notes:
+  * Phase 1 runs implicitly whenever Phase 2 or 3 is requested
+    (Phase 2 needs the target list).
+  * State lives in Jira itself (label + UUID token in summary).
+    Same-day idempotency is provided by logs/today_created.json.
 
 Exit codes:
-  0 — success    1 — phase abort    2 — partial run
+  0 -- success    1 -- abort    2 -- run completed with target errors
 """
 import argparse
 import sys
@@ -65,74 +71,38 @@ def main() -> int:
             logger.critical("Phase 0 failed: %s", exc)
             return 1
 
-    # ── Phase 1 ──────────────────────────────────────────────────────────────
+    # ── Phase 1 (also runs implicitly when Phase 2 or 3 is requested) ────────
     targets: list = []
-    all_target_ids: set = set()
-    if start <= 1 <= end:
+    if end >= 1:
         try:
-            targets, all_target_ids = run_collect()
+            targets, _ = run_collect()
         except Exception as exc:
             logger.critical("Phase 1 failed: %s", exc, exc_info=True)
             _alert("Phase 1 -- Snyk data collection", exc)
             return 1
 
-    # Phase 0/1 stop here — no state, no Jira, no Teams notification
-    if end < 2:
-        logger.info("Run complete (phases %d-%d)", start, end)
-        return 0
-
-    # ── Phases 2-3: state-backed pipeline ────────────────────────────────────
-    import state
-    from phases.notify import run_notify
-    from phases.sync import run_sync
-
-    try:
-        current_state = state.load_state()
-        state.prepare_for_run(current_state)
-    except Exception as exc:
-        logger.critical("State initialisation failed: %s", exc)
-        _alert("State init", exc)
-        return 1
-
-    # Phase 1 checkpoint into state (only when state pipeline is in play)
-    if start <= 1 <= end:
-        current_state["total_count"] = len(targets)
-        for t in targets:
-            state.upsert_target(current_state, t.id, t.display_name)
-        current_state["run_status"] = "partial"
-        try:
-            state.upload_state(current_state)
-        except Exception as exc:
-            logger.critical("Phase 1 state upload failed: %s", exc)
-            _alert("Phase 1 -- state upload", exc)
-            return 1
-
-    # Phase 2
+    # ── Phase 2 ──────────────────────────────────────────────────────────────
     result = None
     if start <= 2 <= end:
+        from phases.sync import run_sync
         try:
-            result = run_sync(targets, all_target_ids, current_state)
+            result = run_sync(targets)
         except Exception as exc:
-            logger.critical("Phase 2 failed: %s", exc)
-            current_state["run_status"] = "failed"
-            try:
-                state.upload_state(current_state)
-            except Exception:
-                pass
+            logger.critical("Phase 2 failed: %s", exc, exc_info=True)
             _alert("Phase 2 -- Jira sync", exc)
             return 1
 
-    # Phase 3
+    # ── Phase 3 ──────────────────────────────────────────────────────────────
     if start <= 3 <= end and result is not None:
+        from phases.notify import run_notify
         try:
-            run_notify(result, current_state)
+            run_notify(result)
         except Exception as exc:
-            logger.critical("Phase 3 failed: %s", exc)
+            logger.critical("Phase 3 failed: %s", exc, exc_info=True)
             return 1
 
-    if result is not None and result.processed_count < current_state.get("total_count", 0):
-        logger.warning("Partial run -- processed %d/%d targets",
-                       result.processed_count, current_state["total_count"])
+    logger.info("Run complete (phases %d-%d)", start, end)
+    if result is not None and result.error_count:
         return 2
     return 0
 

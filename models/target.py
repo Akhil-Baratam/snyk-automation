@@ -17,9 +17,15 @@ class SnykTarget:
     display_name: str
     critical: int
     high: int
+    medium: int = 0
+    low: int = 0
     remote_url: str = ""
     projects: list[ProjectDetail] = field(default_factory=list)
 
     @property
     def has_vulns(self) -> bool:
         return self.critical > 0 or self.high > 0
+
+    @property
+    def total(self) -> int:
+        return self.critical + self.high + self.medium + self.low
