@@ -3,8 +3,8 @@ Phase 0 — Startup validation.
 
 Checks only the dependencies needed for the requested phase range:
   end_phase >= 0 -> Snyk
-  end_phase >= 2 -> Jira reachability
-  end_phase >= 3 -> Teams webhook
+  end_phase >= 2 -> Jira reachability (Phase 2 sync + Phase 3 reverse check)
+  end_phase >= 4 -> Teams webhook
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-def run_validation(end_phase: int = 3, dry_run: bool = False) -> None:
+def run_validation(end_phase: int = 4, dry_run: bool = False) -> None:
     teams = TeamsClient()
     logger.info("Phase 0 -- Startup validation (end_phase=%d)%s",
                 end_phase, " [DRY RUN]" if dry_run else "")
@@ -32,7 +32,7 @@ def run_validation(end_phase: int = 3, dry_run: bool = False) -> None:
     else:
         logger.info("Phase 0 -- skipping Jira check")
 
-    if end_phase >= 3:
+    if end_phase >= 4:
         if not config.TEAMS_WEBHOOK_URL:
             raise RuntimeError("TEAMS_WEBHOOK_URL is not configured")
         if dry_run:

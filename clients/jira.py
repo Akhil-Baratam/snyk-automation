@@ -108,6 +108,35 @@ class JiraClient:
             description=f.get("description"),
         )
 
+    def list_open_snyk_tickets(self) -> list[tuple[str, str]]:
+        """
+        Paginated JQL: every open ticket with the snyk label.
+        Returns [(key, summary), ...]. Used by Phase 3 reverse check.
+        """
+        jql = (
+            f"labels = '{config.JIRA_TICKET_LABEL}' "
+            f"AND statusCategory != 'Done'"
+        )
+        results: list[tuple[str, str]] = []
+        next_token: str | None = None
+        page = 1
+
+        while True:
+            body: dict = {"jql": jql, "fields": ["summary"], "maxResults": 100}
+            if next_token:
+                body["nextPageToken"] = next_token
+            data = self._post("/rest/api/3/search/jql", body)
+            for issue in data.get("issues", []) or []:
+                summary = (issue.get("fields") or {}).get("summary", "") or ""
+                results.append((issue["key"], summary))
+            next_token = data.get("nextPageToken")
+            if not next_token:
+                break
+            page += 1
+
+        logger.info("Fetched %d open snyk-labelled ticket(s) across %d page(s)", len(results), page)
+        return results
+
     def create_ticket(
         self,
         summary: str,

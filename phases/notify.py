@@ -59,6 +59,7 @@ def _build_header(result: RunResult) -> list[dict]:
         {"type": "FactSet", "facts": [
             {"title": "Created",   "value": str(len(result.created))},
             {"title": "Changed",   "value": str(len(result.changed))},
+            {"title": "Flagged",   "value": str(len(result.flagged))},
             {"title": "Processed", "value": str(result.processed_count)},
         ]},
     ]
@@ -92,6 +93,16 @@ def _build_sections(result: RunResult) -> list[list[dict]]:
             sections.append(
                 [_heading(heading, "Warning")]
                 + _table([5, 3], ["Repository", "Ticket"], rows, urls)
+            )
+
+    if result.flagged:
+        all_rows = [[f.target_name, f.ticket_key, f.reason] for f in result.flagged]
+        all_urls = [[None, f.ticket_url, None]              for f in result.flagged]
+        for i, (rows, urls) in enumerate(_chunks(all_rows, all_urls)):
+            heading = "Tickets to Review for Closure" if i == 0 else "Tickets to Review for Closure (cont.)"
+            sections.append(
+                [_heading(heading, "Accent")]
+                + _table([4, 2, 4], ["Repository", "Ticket", "Reason"], rows, urls)
             )
 
     return sections
@@ -156,7 +167,7 @@ def _heading(text: str, color: str) -> dict:
 
 
 def _no_data_block() -> dict:
-    return {"type": "TextBlock", "text": "No new or changed tickets today.",
+    return {"type": "TextBlock", "text": "No actionable tickets today.",
             "isSubtle": True, "spacing": "Medium"}
 
 
