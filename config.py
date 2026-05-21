@@ -51,8 +51,10 @@ JIRA_BASE_URL: str     = _optional("JIRA_BASE_URL", "")
 JIRA_USER_EMAIL: str   = _optional("JIRA_USER_EMAIL", "")
 JIRA_API_TOKEN: str    = _optional("JIRA_API_TOKEN", "")
 JIRA_PROJECT_KEY: str  = _optional("JIRA_PROJECT_KEY", "PSUP")
-JIRA_TICKET_LABEL: str = _optional("JIRA_TICKET_LABEL", "snyk-jolt")
-JIRA_ISSUE_TYPE: str   = _optional("JIRA_ISSUE_TYPE", "Task")
+JIRA_TICKET_LABEL: str       = _optional("JIRA_TICKET_LABEL", "snyk-jolt")
+_labels_raw: str             = _optional("JIRA_TICKET_LABELS", "snyk-jolt,Snyk_Vulnerability,qms-review-not-found,snyk")
+JIRA_TICKET_LABELS: list[str] = [l.strip() for l in _labels_raw.split(",") if l.strip()]
+JIRA_ISSUE_TYPE: str         = _optional("JIRA_ISSUE_TYPE", "Task")
 
 # ── Teams ────────────────────────────────────────────────────────────────────
 # Required from Phase 3 onward. Optional at import.

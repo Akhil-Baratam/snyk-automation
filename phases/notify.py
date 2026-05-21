@@ -20,6 +20,7 @@ from models.run_result import RunResult
 
 logger = logging.getLogger(__name__)
 _INTER_CARD_DELAY = 0.5  # seconds between split sends (Teams: 4 req/s)
+_MAX_ROWS_PER_SECTION = 22
 
 
 def run_notify(result: RunResult, dry_run: bool = False) -> None:
@@ -72,28 +73,33 @@ def _build_header(result: RunResult) -> list[dict]:
 
 def _build_sections(result: RunResult) -> list[list[dict]]:
     sections: list[list[dict]] = []
+
     if result.created:
-        sections.append([
-            _heading("New Tickets Created", "Good"),
-            _table([4, 2, 2], ["Repository", "Ticket", "Severity"], [
-                [_cell(c.target_name),
-                 _cell(c.ticket_key, url=c.ticket_url),
-                 _cell(f"C{c.critical} H{c.high}")]
-                for c in result.created
-            ]),
-        ])
+        all_rows = [[c.target_name, c.ticket_key] for c in result.created]
+        all_urls = [[None, c.ticket_url] for c in result.created]
+        for i, (rows, urls) in enumerate(_chunks(all_rows, all_urls)):
+            heading = "New Tickets Created" if i == 0 else "New Tickets Created (cont.)"
+            sections.append(
+                [_heading(heading, "Good")]
+                + _table([5, 3], ["Repository", "Ticket"], rows, urls)
+            )
+
     if result.changed:
-        sections.append([
-            _heading("Existing Tickets -- Count Changed", "Warning"),
-            _table([4, 2, 2, 2], ["Repository", "Ticket", "Old", "New"], [
-                [_cell(c.target_name),
-                 _cell(c.ticket_key, url=c.ticket_url),
-                 _cell(f"C{c.old_critical} H{c.old_high}"),
-                 _cell(f"C{c.new_critical} H{c.new_high}")]
-                for c in result.changed
-            ]),
-        ])
+        all_rows = [[c.target_name, c.ticket_key] for c in result.changed]
+        all_urls = [[None, c.ticket_url] for c in result.changed]
+        for i, (rows, urls) in enumerate(_chunks(all_rows, all_urls)):
+            heading = "Existing Tickets -- Count Changed" if i == 0 else "Existing Tickets -- Count Changed (cont.)"
+            sections.append(
+                [_heading(heading, "Warning")]
+                + _table([5, 3], ["Repository", "Ticket"], rows, urls)
+            )
+
     return sections
+
+
+def _chunks(rows: list, urls: list) -> list[tuple]:
+    for i in range(0, len(rows), _MAX_ROWS_PER_SECTION):
+        yield rows[i:i + _MAX_ROWS_PER_SECTION], urls[i:i + _MAX_ROWS_PER_SECTION]
 
 
 # ── Packing (size-aware split) ───────────────────────────────────────────────
@@ -154,24 +160,29 @@ def _no_data_block() -> dict:
             "isSubtle": True, "spacing": "Medium"}
 
 
-def _cell(text: str, url: str | None = None) -> dict:
-    inner = {"type": "TextBlock",
-             "text": f"[{text}]({url})" if url else text, "wrap": True}
-    return {"type": "TableCell", "items": [inner]}
-
-
-def _table(widths: list[int], headers: list[str], rows: list[list[dict]]) -> dict:
-    header_cells = [
-        {"type": "TableCell", "style": "emphasis",
-         "items": [{"type": "TextBlock", "text": h, "weight": "Bolder", "wrap": True}]}
-        for h in headers
-    ]
+def _col(text: str, width: int, bold: bool = False, url: str | None = None) -> dict:
+    display = f"[{text}]({url})" if url else text
     return {
-        "type": "Table",
-        "columns": [{"width": w} for w in widths],
-        "rows": [{"type": "TableRow", "style": "emphasis", "cells": header_cells}]
-              + [{"type": "TableRow", "cells": r} for r in rows],
-        "showGridLines": True,
-        "firstRowAsHeaders": True,
-        "spacing": "Small",
+        "type": "Column", "width": width,
+        "items": [{"type": "TextBlock", "text": display,
+                   "wrap": True, "weight": "Bolder" if bold else "Default"}],
     }
+
+
+def _table(widths: list[int], headers: list[str], rows: list[list[str]],
+           urls: list[list[str | None]] | None = None) -> list[dict]:
+    """Returns a list of ColumnSet blocks (header row + data rows)."""
+    blocks: list[dict] = []
+    # header row
+    blocks.append({
+        "type": "ColumnSet", "spacing": "Small",
+        "columns": [_col(h, w, bold=True) for h, w in zip(headers, widths)],
+    })
+    for i, row in enumerate(rows):
+        row_urls = urls[i] if urls else [None] * len(row)
+        blocks.append({
+            "type": "ColumnSet", "spacing": "Small",
+            "columns": [_col(text, w, url=u)
+                        for text, w, u in zip(row, widths, row_urls)],
+        })
+    return blocks

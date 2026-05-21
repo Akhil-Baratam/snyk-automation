@@ -120,7 +120,7 @@ class JiraClient:
             "issuetype":   {"name": config.JIRA_ISSUE_TYPE},
             "summary":     summary,
             "description": description,
-            "labels":      [config.JIRA_TICKET_LABEL],
+            "labels":      config.JIRA_TICKET_LABELS,
             "priority":    {"name": priority},
         }
         if due_date:
@@ -129,6 +129,10 @@ class JiraClient:
         key: str = data["key"]
         logger.info("Created Jira ticket %s (priority=%s, due=%s)", key, priority, due_date or "-")
         return key
+
+    def set_labels(self, ticket_key: str, labels: list[str]) -> None:
+        self._put(f"/rest/api/3/issue/{ticket_key}", {"fields": {"labels": labels}})
+        logger.info("Labels set on %s: %s", ticket_key, labels)
 
     def update_ticket(self, ticket_key: str, summary: str, description: dict) -> None:
         """Update both summary and description in a single PUT."""

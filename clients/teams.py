@@ -25,6 +25,8 @@ class TeamsClient:
         def _call() -> None:
             resp = self._session.post(self._webhook_url, json=payload, timeout=15)
             resp.raise_for_status()
+            body = resp.text.strip()
+            logger.debug("Teams webhook response: %r", body)
         with_retry(_call)
 
     # ── Public API ────────────────────────────────────────────────────────────
