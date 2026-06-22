@@ -12,6 +12,11 @@ The --phase argument accepts either a range ('0-4') or a comma-separated set
 ('0,1,3'). Phase 1 runs implicitly when any later phase is in the set (it
 provides the target list everything downstream needs).
 
+Flags:
+  --dry-run     Preview Phase 2/3/4 without writing to Jira or Teams.
+  --use-cache   Phase 1 loads logs/phase1_cache.json instead of calling Snyk.
+                Cache is always written after a fresh fetch (default behaviour).
+
 State lives in Jira itself (label + UUID token in summary). Same-day
 idempotency is provided by logs/today_created.json.
 
@@ -51,6 +56,8 @@ def main() -> int:
                         help="Range '0-4' or set '0,1,3'. Default: 0-4")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview Phase 2/3/4 actions without writing to Jira or Teams")
+    parser.add_argument("--use-cache", action="store_true",
+                        help="Phase 1: reuse logs/phase1_cache.json instead of fetching from Snyk")
     args = parser.parse_args()
 
     try:
@@ -95,7 +102,7 @@ def main() -> int:
     all_target_ids: set[str] = set()
     if phases & {1, 2, 3, 4}:
         try:
-            targets, all_target_ids = run_collect()
+            targets, all_target_ids = run_collect(use_cache=args.use_cache)
         except Exception as exc:
             logger.critical("Phase 1 failed: %s", exc, exc_info=True)
             _alert("Phase 1 -- Snyk data collection", exc)

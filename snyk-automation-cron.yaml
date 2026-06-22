@@ -1,0 +1,51 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: snyk-automation-cron
+  namespace: argo-workflow
+  annotations:
+    argocd.argoproj.io/tracking-id: >-
+      argo-workflow-templates:argoproj.io/CronWorkflow:argo-workflow/snyk-automation-cron
+spec:
+  # 7:30 PM IST = 14:00 UTC
+  schedule: "0 14 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 0
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 2
+  workflowSpec:
+    activeDeadlineSeconds: 3600
+    entrypoint: run-snyk-automation
+    serviceAccountName: workflow-sa
+    ttlStrategy:
+      secondsAfterCompletion: 86400
+    podGC:
+      deleteDelayDuration: 3600s
+      strategy: OnWorkflowSuccess
+    templates:
+      - name: run-snyk-automation
+        nodeSelector:
+          eks.amazonaws.com/capacityType: SPOT
+        container:
+          name: snyk-runner
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+
+              # Install git
+              apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates
+
+              # Clone repo — same Atlassian token used for Jira works for Bitbucket too
+              git clone "https://${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}@bitbucket.org/tempalert/snyk-automation.git" /app
+              cd /app
+
+              # Install Python dependencies
+              pip install --quiet --no-cache-dir -r requirements.txt
+
+              # Run the full pipeline (0=validate, 1=Snyk, 2=Jira sync, 3=reverse check, 4=Teams)
+              python main.py --phase 0-4
+          envFrom:
+            - secretRef:
+                name: snyk-automation-secret
